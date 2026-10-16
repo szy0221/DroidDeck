@@ -367,6 +367,39 @@ static void h_enumerate_physical_devices(struct vkfw_request *req, void *unused)
     free(devices);
 }
 
+static void h_enumerate_physical_device_groups(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t instance_id = 0;
+    if (!vkfw_cur_u64(&req->in, &instance_id)) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+    VkInstance instance = (VkInstance)vkfw_handle_get(&req->conn->handles, instance_id, VKFW_OBJ_INSTANCE);
+    PFN_vkEnumeratePhysicalDeviceGroups fn =
+        (PFN_vkEnumeratePhysicalDeviceGroups)vkfw_instance_proc(instance, "vkEnumeratePhysicalDeviceGroups");
+    if (!instance || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+
+    uint32_t count = 0;
+    VkResult r = fn(instance, &count, NULL);
+    VkPhysicalDeviceGroupProperties *groups = NULL;
+    if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && count > 0) {
+        groups = calloc(count, sizeof(*groups));
+        if (!groups) { vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY); return; }
+        for (uint32_t i = 0; i < count; i++) groups[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
+        r = fn(instance, &count, groups);
+    }
+
+    vkfw_buf_put_result(req->out, groups ? r : VK_SUCCESS);
+    vkfw_buf_put_u32(req->out, groups ? count : 0);
+    /* Only counts and ids cross: the array holds server-side pointers. */
+    for (uint32_t i = 0; groups && i < count; i++) {
+        vkfw_buf_put_u32(req->out, groups[i].physicalDeviceCount);
+        vkfw_buf_put_u32(req->out, groups[i].subsetAllocation);
+        for (uint32_t d = 0; d < groups[i].physicalDeviceCount; d++)
+            vkfw_buf_put_u64(req->out, vkfw_handle_add(&req->conn->handles, VKFW_OBJ_PHYSICAL_DEVICE,
+                                                       groups[i].physicalDevices[d], instance_id));
+    }
+    free(groups);
+}
+
 static void h_get_physical_device_properties(struct vkfw_request *req, void *unused)
 {
     (void)unused;
@@ -530,6 +563,116 @@ static void h_get_queue_family_properties(struct vkfw_request *req, void *chaine
         vkfw_chain_put(req->out, &chain);
         vkfw_chain_free(&chain);
     }
+    free(props);
+}
+
+/* The *2 form takes one pNext chain per family, so each family is queried
+ * separately on the server: the extra round trips only cost us on a cold query. */
+static void h_get_queue_family_properties2(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t pd_id = 0;
+    if (!vkfw_cur_u64(&req->in, &pd_id)) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+    VkPhysicalDevice pd = (VkPhysicalDevice)vkfw_handle_get(&req->conn->handles, pd_id, VKFW_OBJ_PHYSICAL_DEVICE);
+    VkInstance instance = vkfw_instance_of(req->conn, pd_id);
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties fn1 =
+        (PFN_vkGetPhysicalDeviceQueueFamilyProperties)vkfw_instance_proc(instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties2 fn2 =
+        (PFN_vkGetPhysicalDeviceQueueFamilyProperties2)vkfw_instance_proc(instance, "vkGetPhysicalDeviceQueueFamilyProperties2");
+    if (!pd || !fn1) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+
+    uint32_t wanted = 0;    if (!vkfw_cur_u32(&req->in, &wanted) || wanted > VKFW_MAX_QUEUE_COUNT) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+
+    vkfw_chain *chains = calloc(wanted ? wanted : 1, sizeof(*chains));
+    if (!chains) { vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY); return; }
+    for (uint32_t i = 0; i < wanted; i++) {
+        if (!vkfw_chain_parse(&req->in, &chains[i])) {
+            for (uint32_t j = 0; j <= i; j++) vkfw_chain_free(&chains[j]);
+            free(chains);
+            vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+            return;
+        }
+    }
+
+    uint32_t count = 0;
+    fn1(pd, &count, NULL);
+    if (count == 0) {
+        vkfw_buf_put_result(req->out, VK_SUCCESS);
+        vkfw_buf_put_u32(req->out, 0);
+        for (uint32_t i = 0; i < wanted; i++) {
+            vkfw_chain_put(req->out, &chains[i]);
+            vkfw_chain_free(&chains[i]);
+        }
+        free(chains);
+        return;
+    }
+
+    /* The *2 query takes the whole array at once, each element carrying its own
+     * pNext, so one call fills every family's chain. */
+    VkQueueFamilyProperties2 *q2 = calloc(count, sizeof(*q2));
+    VkQueueFamilyProperties *props = calloc(count, sizeof(*props));
+    if (!q2 || !props) {
+        free(q2);
+        free(props);
+        for (uint32_t i = 0; i < wanted; i++) vkfw_chain_free(&chains[i]);
+        free(chains);
+        vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY);
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        q2[i].sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2;
+        if (i < wanted) q2[i].pNext = vkfw_chain_head(&chains[i]);
+    }
+    fn2(pd, &count, q2);
+    for (uint32_t i = 0; i < count; i++) props[i] = q2[i].queueFamilyProperties;
+
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+    vkfw_buf_put_u32(req->out, count);
+    for (uint32_t i = 0; i < count; i++) vkfw_buf_put(req->out, &props[i], sizeof(props[i]));
+    for (uint32_t i = 0; i < wanted; i++) {
+        vkfw_chain_put(req->out, &chains[i]);
+        vkfw_chain_free(&chains[i]);
+    }
+    free(chains);
+    free(q2);
+    free(props);
+}
+
+static void h_get_sparse_image_format_properties(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t pd_id = 0;
+    uint32_t format = 0, type = 0, samples = 0, usage = 0, tiling = 0;
+    if (!vkfw_cur_u64(&req->in, &pd_id) || !vkfw_cur_u32(&req->in, &format) ||
+        !vkfw_cur_u32(&req->in, &type) || !vkfw_cur_u32(&req->in, &samples) ||
+        !vkfw_cur_u32(&req->in, &usage) || !vkfw_cur_u32(&req->in, &tiling)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    VkPhysicalDevice pd = (VkPhysicalDevice)vkfw_handle_get(&req->conn->handles, pd_id, VKFW_OBJ_PHYSICAL_DEVICE);
+    PFN_vkGetPhysicalDeviceSparseImageFormatProperties fn =
+        (PFN_vkGetPhysicalDeviceSparseImageFormatProperties)vkfw_instance_proc(
+            vkfw_instance_of(req->conn, pd_id), "vkGetPhysicalDeviceSparseImageFormatProperties");
+    if (!pd || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+
+    uint32_t count = 0;
+    fn(pd, (VkFormat)format, (VkImageType)type, (VkSampleCountFlagBits)samples,
+       (VkImageUsageFlags)usage, (VkImageTiling)tiling, &count, NULL);
+
+    VkSparseImageFormatProperties *props = NULL;
+    if (count > 0) {
+        props = calloc(count, sizeof(*props));
+        if (!props) { vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY); return; }
+        fn(pd, (VkFormat)format, (VkImageType)type, (VkSampleCountFlagBits)samples,
+           (VkImageUsageFlags)usage, (VkImageTiling)tiling, &count, props);
+    }
+
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+    vkfw_buf_put_u32(req->out, count);
+    for (uint32_t i = 0; i < count; i++) vkfw_buf_put(req->out, &props[i], sizeof(props[i]));
     free(props);
 }
 
@@ -882,12 +1025,14 @@ static const struct vkfw_entry kDispatch[] = {
     { VKFW_CMD_DESTROY_INSTANCE, h_destroy_instance, NULL },
 
     { VKFW_CMD_ENUMERATE_PHYSICAL_DEVICES, h_enumerate_physical_devices, NULL },
+    { VKFW_CMD_ENUMERATE_PHYSICAL_DEVICE_GROUPS, h_enumerate_physical_device_groups, NULL },
     { VKFW_CMD_GET_PHYSICAL_DEVICE_PROPERTIES, h_get_physical_device_properties, NULL },
     { VKFW_CMD_GET_PHYSICAL_DEVICE_PROPERTIES2, h_get_physical_device_properties2, (void *)1 },
     { VKFW_CMD_GET_PHYSICAL_DEVICE_FEATURES, h_get_physical_device_features, NULL },
     { VKFW_CMD_GET_PHYSICAL_DEVICE_FEATURES2, h_get_physical_device_features2, (void *)1 },
     { VKFW_CMD_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES, h_get_queue_family_properties, NULL },
-    { VKFW_CMD_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES2, h_get_queue_family_properties, (void *)1 },
+    { VKFW_CMD_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES2, h_get_queue_family_properties2, NULL },
+    { VKFW_CMD_GET_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_PROPERTIES, h_get_sparse_image_format_properties, NULL },
     { VKFW_CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES, h_get_memory_properties, NULL },
     { VKFW_CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES2, h_get_memory_properties, (void *)1 },
     { VKFW_CMD_GET_PHYSICAL_DEVICE_FORMAT_PROPERTIES, h_get_format_properties, NULL },

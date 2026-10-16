@@ -410,6 +410,81 @@ static VkResult vkfw_vkEnumeratePhysicalDevices(VkInstance instance, uint32_t *p
     return result;
 }
 
+static VkResult vkfw_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t *pPhysicalDeviceGroupCount,
+                                                     VkPhysicalDeviceGroupProperties *pProperties)
+{
+    struct vkfw_instance *inst = vkfw_as_instance(instance);
+    if (!pPhysicalDeviceGroupCount || !inst) return VK_ERROR_INITIALIZATION_FAILED;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, inst->base.id);
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_ENUMERATE_PHYSICAL_DEVICE_GROUPS, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    if (rc != VK_SUCCESS) {
+        vkfw_buf_free(&reply);
+        *pPhysicalDeviceGroupCount = 0;
+        return vkfw_map_error(rc, VK_ERROR_INITIALIZATION_FAILED);
+    }
+
+    uint32_t count = 0;
+    if (!vkfw_cur_u32(&body, &count)) {
+        vkfw_buf_free(&reply);
+        *pPhysicalDeviceGroupCount = 0;
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if (!pProperties) {
+        vkfw_buf_free(&reply);
+        *pPhysicalDeviceGroupCount = count;
+        return VK_SUCCESS;
+    }
+
+    uint32_t wrote = 0;
+    VkResult result = VK_SUCCESS;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t device_count = 0, subset = 0;
+        if (!vkfw_cur_u32(&body, &device_count) || !vkfw_cur_u32(&body, &subset)) {
+            result = VK_ERROR_INITIALIZATION_FAILED;
+            break;
+        }
+        if (i >= *pPhysicalDeviceGroupCount) {
+            for (uint32_t d = 0; d < device_count; d++) {
+                uint64_t id = 0;
+                vkfw_cur_u64(&body, &id);
+            }
+            continue;
+        }
+        VkPhysicalDeviceGroupProperties *dst = &pProperties[wrote++];
+        memset(dst, 0, sizeof(*dst));
+        dst->subsetAllocation = subset;
+        for (uint32_t d = 0; d < device_count && d < VK_MAX_DEVICE_GROUP_SIZE; d++) {
+            uint64_t id = 0;
+            if (!vkfw_cur_u64(&body, &id)) { result = VK_ERROR_INITIALIZATION_FAILED; break; }
+            void *cached = vkfw_cache_lookup(inst->children, id, d, 0);
+            struct vkfw_object *obj = cached;
+            if (!obj) {
+                obj = calloc(1, sizeof(*obj));
+                if (!obj) { result = VK_ERROR_OUT_OF_HOST_MEMORY; break; }
+                vkfw_obj_init(obj, VKFW_TYPE_PHYSICAL_DEVICE, id);
+                obj = vkfw_cache_insert(&inst->children, id, d, 0, obj);
+            }
+            dst->physicalDevices[d] = (VkPhysicalDevice)obj;
+            dst->physicalDeviceCount++;
+        }
+        if (result != VK_SUCCESS) break;
+    }
+    vkfw_buf_free(&reply);
+
+    if (count > *pPhysicalDeviceGroupCount) {
+        *pPhysicalDeviceGroupCount = wrote;
+        return VK_INCOMPLETE;
+    }
+    *pPhysicalDeviceGroupCount = wrote;
+    return result;
+}
+
 static uint64_t vkfw_phys_id(VkPhysicalDevice pd)
 {
     struct vkfw_object *o = (struct vkfw_object *)pd;
@@ -559,6 +634,139 @@ static void vkfw_vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice pd, u
     *pCount = n;
 }
 
+static void vkfw_vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice pd, uint32_t *pCount,
+                                                           VkQueueFamilyProperties2 *pProps)
+{
+    if (!pCount) return;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, vkfw_phys_id(pd));
+    vkfw_buf_put_u32(&req, pProps ? *pCount : 0u);
+    if (pProps) {
+        for (uint32_t i = 0; i < *pCount; i++) {
+            vkfw_chain chain;
+            if (!vkfw_chain_collect(pProps[i].pNext, &chain)) {
+                vkfw_buf_free(&req);
+                *pCount = 0;
+                return;
+            }
+            vkfw_chain_put(&req, &chain);
+            vkfw_chain_free(&chain);
+        }
+    }
+
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES2, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    if (rc != VK_SUCCESS) {
+        vkfw_buf_free(&reply);
+        *pCount = 0;
+        return;
+    }
+
+    uint32_t count = 0;
+    if (!vkfw_cur_u32(&body, &count)) {
+        vkfw_buf_free(&reply);
+        *pCount = 0;
+        return;
+    }
+    if (!pProps) {
+        vkfw_buf_free(&reply);
+        *pCount = count;
+        return;
+    }
+    uint32_t n = count < *pCount ? count : *pCount;
+    for (uint32_t i = 0; i < n; i++) vkfw_cur_bytes(&body, &pProps[i].queueFamilyProperties,
+                                                    sizeof(pProps[i].queueFamilyProperties));
+    for (uint32_t i = 0; i < n; i++) vkfw_chain_apply(&body, pProps[i].pNext);
+    vkfw_buf_free(&reply);
+    *pCount = n;
+}
+
+static void vkfw_vkGetPhysicalDeviceMemoryProperties2(VkPhysicalDevice pd,
+                                                      VkPhysicalDeviceMemoryProperties2 *pProps)
+{
+    if (!pProps) return;
+    memset(&pProps->memoryProperties, 0, sizeof(pProps->memoryProperties));
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, vkfw_phys_id(pd));
+    vkfw_chain chain;
+    if (!vkfw_chain_collect(pProps->pNext, &chain)) {
+        vkfw_buf_free(&req);
+        return;
+    }
+    vkfw_chain_put(&req, &chain);
+    vkfw_chain_free(&chain);
+
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES2, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    if (rc != VK_SUCCESS) {
+        vkfw_buf_free(&reply);
+        return;
+    }
+    vkfw_cur_bytes(&body, &pProps->memoryProperties, sizeof(pProps->memoryProperties));
+    vkfw_chain_apply(&body, pProps->pNext);
+    vkfw_buf_free(&reply);
+}
+
+static void vkfw_vkGetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice pd, VkFormat format,
+                                                                VkImageType type, VkSampleCountFlagBits samples,
+                                                                VkImageUsageFlags usage, VkImageTiling tiling,
+                                                                uint32_t *pCount,
+                                                                VkSparseImageFormatProperties *pProps)
+{
+    if (!pCount) return;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, vkfw_phys_id(pd));
+    vkfw_buf_put_u32(&req, (uint32_t)format);
+    vkfw_buf_put_u32(&req, (uint32_t)type);
+    vkfw_buf_put_u32(&req, (uint32_t)samples);
+    vkfw_buf_put_u32(&req, (uint32_t)usage);
+    vkfw_buf_put_u32(&req, (uint32_t)tiling);
+
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_GET_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_PROPERTIES, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    if (rc != VK_SUCCESS) {
+        vkfw_buf_free(&reply);
+        *pCount = 0;
+        return;
+    }
+
+    uint32_t count = 0;
+    vkfw_cur_u32(&body, &count);
+    if (!pProps) {
+        vkfw_buf_free(&reply);
+        *pCount = count;
+        return;
+    }
+    uint32_t n = count < *pCount ? count : *pCount;
+    for (uint32_t i = 0; i < n; i++) vkfw_cur_bytes(&body, &pProps[i], sizeof(pProps[i]));
+    vkfw_buf_free(&reply);
+    *pCount = n;
+}
+
+static void vkfw_vkGetPhysicalDeviceSparseImageFormatProperties2(
+    VkPhysicalDevice pd, const VkPhysicalDeviceSparseImageFormatInfo2 *info, uint32_t *pCount,
+    VkSparseImageFormatProperties2 *pProps)
+{
+    if (!info || !pCount) return;
+    /* Only the top-level fields are forwarded; the info struct can chain nodes
+     * with pointers (e.g. sharing-mode QueueFamilyIndices) that cannot cross. */
+    vkfw_vkGetPhysicalDeviceSparseImageFormatProperties(pd, info->format, info->type, info->samples,
+                                                        info->usage, info->tiling, pCount,
+                                                        pProps ? &pProps[0].properties : NULL);
+}
+
 static void vkfw_vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice pd,
                                                    VkPhysicalDeviceMemoryProperties *pProps)
 {
@@ -605,11 +813,12 @@ static void vkfw_vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice pd, VkForm
 }
 
 static void vkfw_vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice pd, VkFormat format,
-                                                    VkFormatProperties2 *pProps)
+                                                      VkFormatProperties2 *pProps)
 {
     if (!pProps) return;
     vkfw_vkGetPhysicalDeviceFormatProperties(pd, format, &pProps->formatProperties);
 }
+
 
 static VkResult vkfw_vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice pd, VkFormat format,
                                                             VkImageType type, VkImageTiling tiling,
@@ -639,6 +848,16 @@ static VkResult vkfw_vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice p
     vkfw_cur_bytes(&body, pProps, sizeof(*pProps));
     vkfw_buf_free(&reply);
     return result;
+}
+
+static VkResult vkfw_vkGetPhysicalDeviceImageFormatProperties2(
+    VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2 *info, VkImageFormatProperties2 *props)
+{
+    if (!info || !props) return VK_ERROR_INITIALIZATION_FAILED;
+    /* Same caveat as the sparse variant: pNext nodes of the info struct may
+     * carry pointers, so only core fields are forwarded. */
+    return vkfw_vkGetPhysicalDeviceImageFormatProperties(pd, info->format, info->type, info->tiling,
+                                                         info->usage, info->flags, &props->imageFormatProperties);
 }
 
 static VkResult vkfw_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char *pLayerName,
@@ -937,15 +1156,21 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetInstanceProcAddr(VkIns
     ENTRY(vkCreateInstance);
     ENTRY(vkDestroyInstance);
     ENTRY(vkEnumeratePhysicalDevices);
+    ENTRY(vkEnumeratePhysicalDeviceGroups);
     ENTRY(vkGetPhysicalDeviceProperties);
     ENTRY(vkGetPhysicalDeviceProperties2);
     ENTRY(vkGetPhysicalDeviceFeatures);
     ENTRY(vkGetPhysicalDeviceFeatures2);
     ENTRY(vkGetPhysicalDeviceQueueFamilyProperties);
+    ENTRY(vkGetPhysicalDeviceQueueFamilyProperties2);
     ENTRY(vkGetPhysicalDeviceMemoryProperties);
+    ENTRY(vkGetPhysicalDeviceMemoryProperties2);
     ENTRY(vkGetPhysicalDeviceFormatProperties);
     ENTRY(vkGetPhysicalDeviceFormatProperties2);
     ENTRY(vkGetPhysicalDeviceImageFormatProperties);
+    ENTRY(vkGetPhysicalDeviceImageFormatProperties2);
+    ENTRY(vkGetPhysicalDeviceSparseImageFormatProperties);
+    ENTRY(vkGetPhysicalDeviceSparseImageFormatProperties2);
     ENTRY(vkEnumerateDeviceExtensionProperties);
     ENTRY(vkEnumerateDeviceLayerProperties);
     ENTRY(vkGetPhysicalDeviceExternalBufferProperties);
@@ -993,9 +1218,10 @@ PFN_vkVoidFunction vk_icdGetPhysicalDeviceProcAddr(VkInstance instance, const ch
 __attribute__((visibility("default")))
 VkResult vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *pSupportedVersion)
 {
-    /* Interface 3 is the last one we can honour: everything above needs
-     * behaviours we do not implement yet (per-instance_DEVICE apis, ...). */
+    /* Interface 5 is the loader's requirement for an ICD advertising Vulkan
+     * 1.1 (policy LDP_DRIVER_7); vk_icdGetPhysicalDeviceProcAddr, which v4+
+     * asks for, is exported below. */
     if (!pSupportedVersion) return VK_ERROR_INITIALIZATION_FAILED;
-    if (*pSupportedVersion > 3) *pSupportedVersion = 3;
+    if (*pSupportedVersion > 5) *pSupportedVersion = 5;
     return VK_SUCCESS;
 }
