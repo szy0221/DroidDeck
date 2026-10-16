@@ -32,7 +32,7 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential libvulkan-dev libvulkan1 mesa-vulkan-drivers vulkan-tools
+            build-essential libvulkan-dev libvulkan1 mesa-vulkan-drivers vulkan-tools gdb
 
       - name: Show the software driver we will forward to
         run: ls -l /usr/share/vulkan/icd.d/
@@ -59,6 +59,7 @@ jobs:
             VKFW_SOCKET=/tmp/vkfw-server.sock \
             VKFW_TRACE=1 \
             VK_LOADER_DEBUG=error,warn \
+            gdb -return-child-result -batch -ex run -ex "bt 25" --args \
             vulkaninfo --summary | tee "$RUNNER_TEMP/vulkaninfo-summary.txt"
           grep -qi 'llvmpipe\|lavapipe' "$RUNNER_TEMP/vulkaninfo-summary.txt"
 

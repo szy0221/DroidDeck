@@ -25,9 +25,12 @@ SRC_ICD="$VK/icd"
 
 COMMON_SRCS=("$SRC_COMMON/vkfw_codec.c" "$SRC_COMMON/vkfw_transport.c" "$SRC_COMMON/vkfw_pnext_sizes.c")
 WARN="-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers"
+# Symbols on: this is a debugging layer, and a CI backtrace is worth more than
+# the few KB saved by stripping.
+CFLAGS="-g ${CFLAGS:-}"
 
 echo "== ICD (glibc $ARCH) =="
-"$CC_BIN" -O2 -fPIC -shared $WARN \
+"$CC_BIN" -O2 $CFLAGS -fPIC -shared $WARN \
     -I"$SRC_COMMON" -I"$SRC_ICD" \
     -o "$OUT/libvulkan_vkforward.so" \
     "$SRC_ICD/vk_forward.c" "${COMMON_SRCS[@]}" \
@@ -45,14 +48,14 @@ cat > "$OUT/vkforward_icd.$ARCH.json" <<EOF
 EOF
 
 echo "== server core + standalone server =="
-"$CC_BIN" -O2 $WARN \
+"$CC_BIN" -O2 $CFLAGS $WARN \
     -I"$SRC_COMMON" -I"$SRC_SERVER" \
     -o "$OUT/vkfw_server" \
     "$SRC_SERVER/vkfw_server_core.c" "$SRC_SERVER/vkfw_server_main.c" "${COMMON_SRCS[@]}" \
     -ldl -lpthread
 
 echo "== loopback test =="
-"$CC_BIN" -O2 $WARN \
+"$CC_BIN" -O2 $CFLAGS $WARN \
     -I"$SRC_COMMON" -I"$SRC_SERVER" -I"$SRC_ICD" \
     -o "$OUT/vkfw_loopback" \
     "$VK/tests/vkfw_loopback.c" "$SRC_ICD/vk_forward.c" "$SRC_SERVER/vkfw_server_core.c" "${COMMON_SRCS[@]}" \
