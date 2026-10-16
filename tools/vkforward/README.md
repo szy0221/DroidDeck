@@ -134,6 +134,12 @@ on every change.
 
 - No rendering commands yet: memory, buffers, images, command buffers and queue
   submission reply `VK_ERROR_FEATURE_NOT_PRESENT`.
+- Core commands that are not implemented answer with a stub that returns that
+  error rather than with NULL. The loader builds a trampoline for every core
+  command whatever the ICD behind it can do, and the trampoline dispatches
+  through a table it filled from the ICD, so a NULL there is a call through
+  address zero. Extension commands still answer NULL, because that NULL is
+  what an app checks before using the extension.
 - `vkCreateInstance` forwards app/engine info and enabled names only; the
   loader's own pNext nodes do not cross the socket.
 - Window system integration is not forwarded — gamescope owns presentation.

@@ -11,6 +11,7 @@
  * repeated enumeration returns the same pointers, as the spec requires.
  */
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1232,6 +1233,52 @@ static void vkfw_trace_missing(const char *table, const char *pName)
     if (enabled) fprintf(stderr, "vkforward: unsupported %s entry point %s\n", table, pName);
 }
 
+/*
+ * The loader builds a trampoline for every core command whether or not the ICD
+ * behind it can serve that command, and the trampoline dispatches through a
+ * dispatch table it filled from this ICD. So a core command we answer NULL for
+ * is not a polite refusal, it is a call through address zero: a segfault at
+ * 0x0, with a stack that names nothing. vulkaninfo dies that way the moment it
+ * has a device, which is exactly when M1 has nothing left to hide behind.
+ *
+ * Extension commands are the opposite and must keep answering NULL: the loader
+ * answers NULL for those itself once the ICD does not have them, and that NULL
+ * is what an app checks before using the extension.
+ */
+static const char *const VKFW_VENDOR_TAGS[] = {
+    "KHR", "EXT", "NV", "NVX", "AMD", "AMDX", "ARM", "ANDROID", "MVK", "KHX",
+    "QCOM", "INTEL", "IMG", "FUCHSIA", "SEC", "VALVE", "GOOGLE", "HUAWEI",
+    "MTL", "NN", "QNX", "OHOS", "MSFT", "NSOBJC", NULL,
+};
+
+static bool vkfw_is_core_command(const char *pName)
+{
+    size_t n = strlen(pName);
+    for (const char *const *tag = VKFW_VENDOR_TAGS; *tag; tag++) {
+        size_t taglen = strlen(*tag);
+        if (n > taglen && strcmp(pName + n - taglen, *tag) == 0) return false;
+    }
+    return true;
+}
+
+/* Stands in for every core command this ICD has not reached yet. AArch64
+ * passes arguments in registers and the caller cleans up nothing, so one
+ * no-argument function answers every signature: whatever the caller put in
+ * x0-x7 is simply left alone, and x0 comes back holding the error. */
+static VKAPI_ATTR VkResult VKAPI_CALL vkfw_core_not_implemented(void)
+{
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+/* NULL for an extension we cannot serve, a stub for a core command we cannot
+ * serve yet. M2 replaces the stubs one at a time. */
+static PFN_vkVoidFunction vkfw_absent(const char *table, const char *pName)
+{
+    vkfw_trace_missing(table, pName);
+    if (!vkfw_is_core_command(pName)) return NULL;
+    return (PFN_vkVoidFunction)(size_t)&vkfw_core_not_implemented;
+}
+
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetDeviceProcAddr(VkDevice device, const char *pName);
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetInstanceProcAddr(VkInstance instance, const char *pName)
@@ -1297,8 +1344,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetInstanceProcAddr(VkIns
     ENTRY(vkDeviceWaitIdle);
 #undef ENTRY
 #undef ALIAS
-    vkfw_trace_missing("instance", pName);
-    return NULL;
+    return vkfw_absent("instance", pName);
 }
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetDeviceProcAddr(VkDevice device, const char *pName)
@@ -1315,8 +1361,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetDeviceProcAddr(VkDevic
     ENTRY(vkDeviceWaitIdle);
 #undef ENTRY
 #undef ALIAS
-    vkfw_trace_missing("device", pName);
-    return NULL;
+    return vkfw_absent("device", pName);
 }
 
 /* ---- loader-facing exports ---------------------------------------------- */
