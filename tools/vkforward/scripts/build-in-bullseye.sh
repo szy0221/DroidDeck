@@ -19,8 +19,12 @@ HEADER_VERSION=1.4.309
 printf 'deb http://archive.debian.org/debian bullseye main\ndeb http://archive.debian.org/debian-security bullseye-security main\n' \
     > /etc/apt/sources.list
 apt-get -o Acquire::Check-Valid-Until=false update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-    gcc binutils curl ca-certificates zip unzip >/dev/null
+# libc6-dev is named even though gcc pulls it, because a build that cannot
+# find stdint.h is a far more confusing failure than one that says which
+# package was missing.
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    gcc libc6-dev binutils curl ca-certificates zip unzip
+ls /usr/include/stdint.h /usr/include/pthread.h
 
 for attempt in 1 2 3 4 5 6; do
     curl -fsSL -o /tmp/vulkan-headers.tar.gz \
