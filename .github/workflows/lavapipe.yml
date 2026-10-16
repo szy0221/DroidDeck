@@ -7,7 +7,7 @@ name: Build lavapipe (software Vulkan) for the Linux runtime
 # result is a single self-contained libvulkan_lvp.so that can be dropped in
 # through the app's "Linux driver" import (which copies only the .so).
 
-on:
+"on":
   workflow_dispatch:
 
 permissions:
