@@ -1,0 +1,105 @@
+name: Build vkforward (Mali Vulkan forwarding layer)
+
+# Route B places a forwarding ICD in the proot Linux runtime. The runtime cannot
+# be tested here, but everything else can be, on genuine hardware for the GPU:
+# push-mode loops below run the forwarding layer against lavapipe on a native
+# aarch64 runner, which exercises exactly the same code paths the tablet uses.
+
+on:
+  push:
+    paths:
+      - 'tools/vkforward/**'
+      - '.github/workflows/vkforward.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vkforward-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  runtime-aarch64:
+    name: Build and verify against lavapipe (aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libvulkan-dev libvulkan1 mesa-vulkan-drivers vulkan-tools
+
+      - name: Show the software driver we will forward to
+        run: ls -l /usr/share/vulkan/icd.d/
+
+      - name: Build
+        run: tools/vkforward/scripts/build-linux.sh
+
+      - name: Loopback check, forwarded properties come back intact
+        env:
+          VKFW_DRIVER: /usr/lib/aarch64-linux-gnu/libvulkan_lvp.so
+        run: tools/vkforward/build-linux/vkfw_loopback /tmp/vkfw-loopback.sock
+
+      - name: End-to-end vulkaninfo through the real loader
+        env:
+          VKFW_DRIVER: /usr/lib/aarch64-linux-gnu/libvulkan_lvp.so
+        run: |
+          set -euxo pipefail
+          cd tools/vkforward/build-linux
+          ./vkfw_server /tmp/vkfw-server.sock &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 20); do [ -S /tmp/vkfw-server.sock ] && break; sleep 0.2; done
+          VK_ICD_FILENAMES="$PWD/vkforward_icd.aarch64.json" \
+            VKFW_SOCKET=/tmp/vkfw-server.sock \
+            vulkaninfo --summary | tee "$RUNNER_TEMP/vulkaninfo-summary.txt"
+          grep -qi 'llvmpipe\|lavapipe' "$RUNNER_TEMP/vulkaninfo-summary.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vkforward-runtime-aarch64
+          path: |
+            tools/vkforward/build-linux/libvulkan_vkforward.so
+            tools/vkforward/build-linux/vkforward_icd.aarch64.json
+            tools/vkforward/build-linux/vkfw_server
+
+  android-server:
+    name: Build the app-side server with the NDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the NDK side by side of the app build
+        run: |
+          set -euxo pipefail
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018" cmake "3.22.1"
+
+      - name: Build the forwarding library for aarch64 Android
+        run: |
+          set -euxo pipefail
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+          CLANG="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang"
+          OUT="$PWD/tools/vkforward/build-android"
+          mkdir -p "$OUT"
+          WARN="-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers"
+          "$CLANG" -O2 -fPIC -shared $WARN \
+            -I tools/vkforward/common -I tools/vkforward/server \
+            -o "$OUT/libvkforward_server.so" \
+            tools/vkforward/server/vkfw_server_core.c \
+            tools/vkforward/server/vk_forward_server.c \
+            tools/vkforward/common/vkfw_codec.c \
+            tools/vkforward/common/vkfw_transport.c \
+            tools/vkforward/common/vkfw_pnext_sizes.c \
+            -ldl -llog
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vkforward-android-server
+          path: tools/vkforward/build-android/libvkforward_server.so

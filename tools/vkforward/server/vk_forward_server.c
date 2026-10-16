@@ -1,70 +1,98 @@
 /*
- * vkforward server (M1 skeleton — does not render yet)
+ * JNI bridge between the Kotlin server object and the forwarding core.
  *
- * Runs inside the Android app process (loaded via JNI from the Kotlin
- * service). Owns the real Vulkan stack: dlopen("libvulkan.so") resolves to
- * the vendor driver (Mali/Immortalis on XRING O3). Receives serialized calls
- * from the ICD stub over a Unix socket and executes them on real handles.
- *
- * Handle model: clients see 64-bit ids; this side keeps id -> real handle.
+ * Binds an abstract-namespace socket (so nothing has to be bind-mounted into
+ * the proot session and no file needs a path inside the app sandbox), then runs
+ * one accept loop for the whole app process. The core itself is shared with the
+ * host tests and knows nothing about JNI.
  */
+#include <jni.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-#include <stdint.h>
-#include <stddef.h>
+#include "vkfw_server_core.h"
+#include "vkfw_transport.h"
 
-#define VKFW_MAGIC 0x564B4657u /* 'VKFW' */
+#ifdef __ANDROID__
+#include <android/log.h>
+#define VKFW_LOG_TAG "vkforward"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, VKFW_LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, VKFW_LOG_TAG, __VA_ARGS__)
+#else
+#include <stdio.h>
+#define LOGI(...)                                                                              \
+    do {                                                                                       \
+        fprintf(stderr, "[vkforward] " __VA_ARGS__);                                           \
+        fputc('\n', stderr);                                                                   \
+    } while (0)
+#define LOGE(...)                                                                              \
+    do {                                                                                       \
+        fprintf(stderr, "[vkforward] " __VA_ARGS__);                                           \
+        fputc('\n', stderr);                                                                   \
+    } while (0)
+#endif
 
-struct vkfw_frame {
-    uint32_t magic;
-    uint16_t cmd;
-    uint16_t flags;
-    uint64_t seq;
-    /* payload follows */
+#define VKFW_ABSTRACT_SOCKET "vkforward"
+
+struct vkfw_thread_arg {
+    int listen_fd;
 };
 
-enum {
-    VKFW_CMD_ENUMERATE_PHYSICAL_DEVICES = 1,
-    VKFW_CMD_GET_DEVICE_PROPS,
-    VKFW_CMD_CREATE_DEVICE,
-    VKFW_CMD_CREATE_BUFFER,
-    VKFW_CMD_ALLOCATE_MEMORY,
-    VKFW_CMD_QUEUE_SUBMIT,
-    VKFW_CMD_QUEUE_WAIT_IDLE,
-    /* DXVK needs fences + timeline semaphores; add before M2 ships. */
-};
-
-/* System Vulkan (vendor Mali driver), resolved at server start. */
-static void *g_libvulkan;
-static void *(*g_get_instance_proc_addr)(void *instance, const char *name);
-
-static int vkfw_load_driver(void)
+static void *vkfw_jni_thread(void *p)
 {
-    /* TODO(M1): dlopen("libvulkan.so", RTLD_NOW|RTLD_LOCAL),
-       dlsym vkGetInstanceProcAddr. The app process is a normal Android
-       process, so the vendor ICD is already in the linker namespace — no
-       adrenotools-style hook needed. */
-    g_libvulkan = 0;
-    g_get_instance_proc_addr = 0;
-    return -1;
+    struct vkfw_thread_arg *arg = (struct vkfw_thread_arg *)p;
+    int fd = arg->listen_fd;
+    free(arg);
+    vkfw_server_main(fd);
+    close(fd);
+    return NULL;
 }
 
-/* One connection = one proot session. Dispatch loop: read frame, route by
-   cmd, write reply with matching seq. */
-static void vkfw_serve_connection(int fd)
+JNIEXPORT jint JNICALL Java_com_droiddeck_launcher_gpu_VkForwardServer_nativeStart(JNIEnv *env,
+                                                                                   jobject thiz,
+                                                                                   jstring endpoint)
 {
-    struct vkfw_frame f;
-    (void)fd; (void)f;
-    /* TODO(M1): framing read/write, dispatch table, id maps for
-       instance/device/queue/buffer/memory/fence/semaphore. */
-}
+    (void)thiz;
 
-/* JNI entry: called from VkForwardServer.kt when a session starts. Returns 0
-   on success. */
-int vkfw_server_main(int listen_fd)
-{
-    if (vkfw_load_driver() != 0) return -1;
-    (void)listen_fd;
-    /* TODO(M1): accept loop, one thread per connection (proot spawns many
-       short-lived processes; keep accept cheap, consider SO_PASSCRED). */
-    return 0;
+    const char *name = VKFW_ABSTRACT_SOCKET;
+    if (endpoint) name = (*env)->GetStringUTFChars(env, endpoint, NULL);
+    if (!name) {
+        LOGE("no socket name");
+        return -4;
+    }
+
+    if (vkfw_server_init(NULL) != 0) {
+        LOGE("server init failed: no Vulkan library");
+        if (endpoint) (*env)->ReleaseStringUTFChars(env, endpoint, name);
+        return -1;
+    }
+
+    int listen_fd = vkfw_listen(name);
+    if (listen_fd < 0) {
+        LOGE("cannot listen on abstract socket %s (errno follows)", name);
+        if (endpoint) (*env)->ReleaseStringUTFChars(env, endpoint, name);
+        return -2;
+    }
+    if (endpoint) (*env)->ReleaseStringUTFChars(env, endpoint, name);
+
+    struct vkfw_thread_arg *arg = malloc(sizeof(*arg));
+    if (!arg) {
+        close(listen_fd);
+        LOGE("out of memory starting the accept loop");
+        return -3;
+    }
+    arg->listen_fd = listen_fd;
+
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, vkfw_jni_thread, arg) != 0) {
+        free(arg);
+        close(listen_fd);
+        LOGE("pthread_create failed");
+        return -3;
+    }
+    pthread_detach(thread);
+    LOGI("listening (abstract socket '%s', fd %d)", name, listen_fd);
+    return listen_fd;
 }

@@ -1,48 +1,37 @@
 package com.droiddeck.launcher.gpu
 
-import android.system.Os
-import android.system.OsConstants
 import android.util.Log
-import java.io.File
 
 /**
- * Android-side half of the Mali Vulkan forwarding layer (M1 skeleton).
+ * Android-side half of the Vulkan forwarding layer (route B).
  *
- * Binds a Unix socket inside the app sandbox; the session script bind-mounts
- * it into the proot runtime so the ICD stub can reach it. The native server
- * (`vk_forward_server.c`) owns the real vendor Vulkan driver.
+ * Starts the native server once per app process. The native side binds an
+ * abstract-namespace Unix socket ("vkforward"), which is why the proot session
+ * needs nothing mounted: abstract sockets live outside the filesystem, so the
+ * ICD stub inside the runtime can reach them with `VKFW_SOCKET=@vkforward`
+ * even though it has its own mount namespace.
  *
- * Not wired into session startup yet — see
- * docs/development/mali-vulkan-forwarding.md for the plan.
+ * See docs/development/mali-vulkan-forwarding.md and tools/vkforward/README.md.
  */
 object VkForwardServer {
     private const val TAG = "VkForwardServer"
-    private const val SOCKET_NAME = "vkforward.sock"
+    private const val SOCKET_NAME = "vkforward"
 
-    @Volatile private var running = false
+    @Volatile private var listeners = 0
 
-    private external fun nativeMain(listenFd: Int): Int
+    private external fun nativeStart(endpoint: String): Int
 
-    fun socketDir(context: android.content.Context): File =
-        File(context.filesDir, ".vkforward").apply { mkdirs() }
-
-    /** Starts the server thread. Safe to call once per app process. */
+    /** Starts the accept loop. Safe to call more than once per process. */
     @Synchronized
-    fun start(context: android.content.Context) {
-        if (running) return
-        val socket = File(socketDir(context), SOCKET_NAME)
-        socket.delete()
-        val fd = Os.socket(OsConstants.AF_UNIX, OsConstants.SOCK_STREAM, 0)
-        try {
-            Os.bind(fd, java.net.UnixDomainSocketAddress.of(socket.path))
-            Os.listen(fd, 4)
-            System.loadLibrary("vkforward_server")
-            Thread({ nativeMain(fd) }, "vkforward-server").apply { isDaemon = true }.start()
-            running = true
-            Log.i(TAG, "listening on ${socket.path}")
-        } catch (t: Throwable) {
-            Os.close(fd)
-            Log.e(TAG, "server start failed", t)
+    fun start(): Boolean {
+        if (listeners > 0) return true
+        val fd = nativeStart(SOCKET_NAME)
+        if (fd < 0) {
+            Log.w(TAG, "vkforward server not available (fd=$fd)")
+            return false
         }
+        listeners++
+        Log.i(TAG, "vkforward server up, abstract socket '$SOCKET_NAME'")
+        return true
     }
 }
