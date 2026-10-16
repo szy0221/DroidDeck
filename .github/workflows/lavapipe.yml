@@ -58,7 +58,7 @@ jobs:
       - name: Build
         run: ninja -C mesa/build -j"$(nproc)"
 
-      - name: Package (only what the import reads: the .so + meta)
+      - name: Package the .so and its metadata
         run: |
           set -euxo pipefail
           SO=$(find mesa/build/src/vulkan -name 'libvulkan_lvp.so' | head -1)
