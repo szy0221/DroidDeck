@@ -90,9 +90,9 @@ int main(int argc, char **argv)
         p2.pNext = &driver;
         props2(devices[i], &p2);
         printf("[loader probe] device %u: %s\n", i, p2.properties.deviceName);
-        printf("  driver=%s maxImageDimension2D=%u subgroupSize=%u timelineSemaphore=%u\n",
+        printf("  driver=%s maxImageDimension2D=%u subgroupSize=%u denormBehaviorIndependence=%u\n",
                driver.driverName, p2.properties.limits.maxImageDimension2D, v11.subgroupSize,
-               v12.timelineSemaphore);
+               v11.pointClippingBehavior);
 
         VkPhysicalDeviceVulkan11Features f11 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
         VkPhysicalDeviceVulkan12Features f12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
@@ -100,7 +100,7 @@ int main(int argc, char **argv)
         VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
         f2.pNext = &f11;
         features2(devices[i], &f2);
-        printf("  features2: multiDrawIndirect=%u bufferDeviceAddress=%u\n", f11.multiview,
+        printf("  features2: multiview=%u bufferDeviceAddress=%u\n", f11.multiview,
                f12.bufferDeviceAddress);
 
         uint32_t qf_count = 0;
