@@ -756,6 +756,57 @@ static void vkfw_vkGetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice
     *pCount = n;
 }
 
+static VkResult vkfw_vkGetPhysicalDeviceToolProperties(VkPhysicalDevice pd, uint32_t *pToolCount,
+                                                       VkPhysicalDeviceToolProperties *pTools)
+{
+    if (!pToolCount) return VK_ERROR_INITIALIZATION_FAILED;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, vkfw_phys_id(pd));
+
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_GET_PHYSICAL_DEVICE_TOOL_PROPERTIES, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    if (rc != VK_SUCCESS) {
+        vkfw_buf_free(&reply);
+        *pToolCount = 0;
+        return vkfw_map_error(rc, VK_ERROR_INITIALIZATION_FAILED);
+    }
+
+    uint32_t count = 0;
+    if (!vkfw_cur_u32(&body, &count)) {
+        vkfw_buf_free(&reply);
+        *pToolCount = 0;
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if (!pTools) {
+        vkfw_buf_free(&reply);
+        *pToolCount = count;
+        return VK_SUCCESS;
+    }
+    uint32_t wrote = 0;
+    VkResult result = VK_SUCCESS;
+    for (uint32_t i = 0; i < count; i++) {
+        VkPhysicalDeviceToolProperties props;
+        memset(&props, 0, sizeof(props));
+        if (!vkfw_cur_bytes(&body, &props, sizeof(props))) {
+            result = VK_ERROR_INITIALIZATION_FAILED;
+            break;
+        }
+        if (i < *pToolCount) pTools[wrote++] = props;
+    }
+    vkfw_buf_free(&reply);
+
+    if (count > *pToolCount) {
+        *pToolCount = wrote;
+        return VK_INCOMPLETE;
+    }
+    *pToolCount = wrote;
+    return result;
+}
+
 static void vkfw_vkGetPhysicalDeviceSparseImageFormatProperties2(
     VkPhysicalDevice pd, const VkPhysicalDeviceSparseImageFormatInfo2 *info, uint32_t *pCount,
     VkSparseImageFormatProperties2 *pProps)
@@ -1159,6 +1210,9 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetInstanceProcAddr(VkIns
 
 #define ENTRY(name)                                                                            \
     if (!strcmp(pName, #name)) return (PFN_vkVoidFunction)(size_t)&vkfw_##name
+/* A pre-promotion / vendor spelling that points at the same implementation. */
+#define ALIAS(name, impl)                                                                      \
+    if (!strcmp(pName, #name)) return (PFN_vkVoidFunction)(size_t)&vkfw_vk##impl
 
     ENTRY(vkGetInstanceProcAddr);
     ENTRY(vkEnumerateInstanceVersion);
@@ -1187,12 +1241,29 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetInstanceProcAddr(VkIns
     ENTRY(vkGetPhysicalDeviceExternalBufferProperties);
     ENTRY(vkGetPhysicalDeviceExternalFenceProperties);
     ENTRY(vkGetPhysicalDeviceExternalSemaphoreProperties);
+    ENTRY(vkGetPhysicalDeviceToolProperties);
+    /* Pre-promotion aliases: tools that enable VK_KHR_get_physical_device_properties2
+     * still call these commands under their KHR names, and the EXT-suffixed tool
+     * properties is the same command, so all spellings must resolve. */
+    ALIAS(vkEnumeratePhysicalDeviceGroupsKHR, EnumeratePhysicalDeviceGroups);
+    ALIAS(vkGetPhysicalDeviceProperties2KHR, GetPhysicalDeviceProperties2);
+    ALIAS(vkGetPhysicalDeviceFeatures2KHR, GetPhysicalDeviceFeatures2);
+    ALIAS(vkGetPhysicalDeviceQueueFamilyProperties2KHR, GetPhysicalDeviceQueueFamilyProperties2);
+    ALIAS(vkGetPhysicalDeviceMemoryProperties2KHR, GetPhysicalDeviceMemoryProperties2);
+    ALIAS(vkGetPhysicalDeviceFormatProperties2KHR, GetPhysicalDeviceFormatProperties2);
+    ALIAS(vkGetPhysicalDeviceImageFormatProperties2KHR, GetPhysicalDeviceImageFormatProperties2);
+    ALIAS(vkGetPhysicalDeviceSparseImageFormatProperties2KHR, GetPhysicalDeviceSparseImageFormatProperties2);
+    ALIAS(vkGetPhysicalDeviceExternalBufferPropertiesKHR, GetPhysicalDeviceExternalBufferProperties);
+    ALIAS(vkGetPhysicalDeviceExternalFencePropertiesKHR, GetPhysicalDeviceExternalFenceProperties);
+    ALIAS(vkGetPhysicalDeviceExternalSemaphorePropertiesKHR, GetPhysicalDeviceExternalSemaphoreProperties);
+    ALIAS(vkGetPhysicalDeviceToolPropertiesEXT, GetPhysicalDeviceToolProperties);
     ENTRY(vkCreateDevice);
     ENTRY(vkDestroyDevice);
     ENTRY(vkGetDeviceProcAddr);
     ENTRY(vkGetDeviceQueue);
     ENTRY(vkDeviceWaitIdle);
 #undef ENTRY
+#undef ALIAS
     vkfw_trace_missing(pName);
     return NULL;
 }
@@ -1210,6 +1281,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetDeviceProcAddr(VkDevic
     ENTRY(vkGetDeviceQueue);
     ENTRY(vkDeviceWaitIdle);
 #undef ENTRY
+#undef ALIAS
     vkfw_trace_missing(pName);
     return NULL;
 }

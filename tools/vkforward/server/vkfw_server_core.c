@@ -806,6 +806,46 @@ static void h_enumerate_device_layers(struct vkfw_request *req, void *unused)
     vkfw_buf_put_u32(req->out, 0);
 }
 
+static void h_get_physical_device_tool_properties(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t pd_id = 0;
+    if (!vkfw_cur_u64(&req->in, &pd_id)) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+    VkPhysicalDevice pd = (VkPhysicalDevice)vkfw_handle_get(&req->conn->handles, pd_id, VKFW_OBJ_PHYSICAL_DEVICE);
+    PFN_vkGetPhysicalDeviceToolProperties fn =
+        (PFN_vkGetPhysicalDeviceToolProperties)vkfw_instance_proc(vkfw_instance_of(req->conn, pd_id),
+                                                                  "vkGetPhysicalDeviceToolProperties");
+    if (!pd) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+    if (!fn) {
+        /* Nothing to report rather than a failure: this is information, and an
+         * absent entry point means the driver predates it. */
+        vkfw_buf_put_result(req->out, VK_SUCCESS);
+        vkfw_buf_put_u32(req->out, 0);
+        return;
+    }
+
+    uint32_t count = 0;
+    if (fn(pd, &count, NULL) != VK_SUCCESS || count == 0) {
+        vkfw_buf_put_result(req->out, VK_SUCCESS);
+        vkfw_buf_put_u32(req->out, 0);
+        return;
+    }
+    VkPhysicalDeviceToolProperties *props = calloc(count, sizeof(*props));
+    if (!props) { vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY); return; }
+    for (uint32_t i = 0; i < count; i++) props[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TOOL_PROPERTIES;
+    if (fn(pd, &count, props) != VK_SUCCESS) {
+        free(props);
+        vkfw_buf_put_result(req->out, VK_SUCCESS);
+        vkfw_buf_put_u32(req->out, 0);
+        return;
+    }
+
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+    vkfw_buf_put_u32(req->out, count);
+    for (uint32_t i = 0; i < count; i++) vkfw_buf_put(req->out, &props[i], sizeof(props[i]));
+    free(props);
+}
+
 static void h_get_external_buffer_properties(struct vkfw_request *req, void *unused)
 {
     (void)unused;
@@ -1042,6 +1082,7 @@ static const struct vkfw_entry kDispatch[] = {
     { VKFW_CMD_GET_PHYSICAL_DEVICE_EXTERNAL_BUFFER_PROPERTIES, h_get_external_buffer_properties, NULL },
     { VKFW_CMD_GET_PHYSICAL_DEVICE_EXTERNAL_FENCE_PROPERTIES, h_get_external_sync_properties, (void *)1 },
     { VKFW_CMD_GET_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_PROPERTIES, h_get_external_sync_properties, NULL },
+    { VKFW_CMD_GET_PHYSICAL_DEVICE_TOOL_PROPERTIES, h_get_physical_device_tool_properties, NULL },
 
     { VKFW_CMD_CREATE_DEVICE, h_create_device, NULL },
     { VKFW_CMD_DESTROY_DEVICE, h_destroy_device, NULL },
