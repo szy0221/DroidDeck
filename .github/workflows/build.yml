@@ -398,6 +398,10 @@ jobs:
 
       - name: Check Quest tracking IPC
         run: |
+          # tools/vr/src/presenter.cpp includes <vulkan/vulkan_core.h>; the runner
+          # image does not always ship the headers, so make sure they are there.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvulkan-dev
           g++ -std=c++17 -Wall -Wextra -Werror -pthread tools/vr/tests/test_xr_tracking.cpp -o /tmp/test-xr-tracking
           /tmp/test-xr-tracking
           g++ -std=c++17 -Wall -Wextra -Werror tools/vr/tests/test_xr_touch.cpp -o /tmp/test-xr-touch
