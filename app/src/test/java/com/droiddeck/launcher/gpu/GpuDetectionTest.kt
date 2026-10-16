@@ -3,6 +3,8 @@ package com.droiddeck.launcher.gpu
 import com.droiddeck.launcher.gpu.GpuInfo.Family
 import com.droiddeck.launcher.gpu.GpuInfo.Support
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GpuDetectionTest {
@@ -29,6 +31,40 @@ class GpuDetectionTest {
         assertEquals(Family.NOT_ADRENO, GpuInfo.familyOf(false, GpuInfo.threeDigits("Mali-G720-Immortalis MC12")))
         assertEquals(Family.NOT_ADRENO, GpuInfo.familyOf(false, GpuInfo.threeDigits("Mali-G715")))
         assertEquals(Family.NOT_ADRENO, GpuInfo.familyOf(false, 830))
+    }
+
+    @Test fun maliVulkanDevicesGetTheirOwnFamily() {
+        assertEquals(Family.MALI, GpuInfo.familyOf(false, 0, "Mali-G720-Immortalis MC12"))
+        assertEquals(Family.MALI, GpuInfo.familyOf(false, 0, "Immortalis-G925 MC16"))
+        assertEquals(Family.MALI, GpuInfo.familyOf(false, 0, "Mali-G2-Ultra NX"))
+        assertEquals(Family.MALI, GpuInfo.familyOf(false, 0, "mali-g610"))
+        assertEquals(Family.NOT_ADRENO, GpuInfo.familyOf(false, 0, "Samsung Xclipse 920"))
+        assertEquals(Family.NOT_ADRENO, GpuInfo.familyOf(false, 0, ""))
+        // An Adreno stays Adreno even if the vendor string is odd.
+        assertEquals(Family.A8XX, GpuInfo.familyOf(true, 830, "Adreno (TM) 830"))
+    }
+
+    @Test fun maliFallbacksOnlyFireOnMaliEvidence() {
+        // A Xiaomi XRING O3 reports ro.hardware.vulkan=mali and ships vulkan.mali.so,
+        // so it is still recognised when the Vulkan query itself comes back empty.
+        assertTrue(GpuInfo.isMali("mali"))
+        assertTrue(GpuInfo.isMali("Mali-G720-Immortalis MC12"))
+        assertTrue(GpuInfo.isMali("Immortalis-G925 MC16"))
+        assertFalse(GpuInfo.isMali("Samsung Xclipse 920"))
+        assertFalse(GpuInfo.isMali("Adreno (TM) 830"))
+        assertFalse(GpuInfo.isMali(""))
+        // No mali node and no mali HAL on the machine running the tests: the extra
+        // probes must never promote a non-Mali device into the Mali family.
+        assertFalse(GpuInfo.isMaliDevice("Samsung Xclipse 920"))
+        assertFalse(GpuInfo.isMaliDevice(""))
+        assertEquals(Family.NOT_ADRENO, GpuInfo.familyOf(false, 0, "Samsung Xclipse 920"))
+    }
+
+    @Test fun maliRunsInSoftwareMode() {
+        val mali = GpuInfo(name = "Mali-G2-Ultra NX", model = 0, family = Family.MALI, soc = "", oneUi8Gen2 = false)
+        assertEquals(Support.SOFTWARE, mali.support)
+        assertEquals("Experimental: no Linux Vulkan driver for this GPU; games fall back to software rendering", mali.supportText)
+        assertEquals("Mali / Immortalis", Family.MALI.label)
     }
 
     @Test fun familyBoundaries() {

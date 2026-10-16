@@ -52,6 +52,10 @@ class DriverPairsTest {
         assertEquals(DriverPairs.BANNER_710, DriverPairs.recommendedKey(gpu(720), emptyList()))
         assertEquals(DriverPairs.BANNER, DriverPairs.recommendedKey(gpu(650), emptyList()))
         assertNull(DriverPairs.recommendedKey(gpu(0, adreno = false), emptyList()))
+        assertNull(
+            "Mali has no Turnip recommendation",
+            DriverPairs.recommendedKey(GpuInfo("Mali", 0, Family.MALI, "", false), emptyList()),
+        )
     }
 
     @Test

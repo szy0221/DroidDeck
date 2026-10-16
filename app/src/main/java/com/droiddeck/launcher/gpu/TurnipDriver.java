@@ -272,6 +272,15 @@ public final class TurnipDriver {
     }
 
     private String chooseByDevice() {
+        if (!com.droiddeck.launcher.core.DeviceSupport.INSTANCE.adreno()) {
+            String vulkanDevice = GpuInfo.Companion.vulkanDeviceName();
+            if (!vulkanDevice.isEmpty() && !vulkanDevice.toLowerCase(java.util.Locale.US).contains("adreno")) {
+                Log.i(TAG, "not an Adreno GPU (" + vulkanDevice + "); the compositor falls back to the system Vulkan driver");
+                return null;
+            }
+            // No GPU info at all: keep the generic Turnip fallback for Adreno
+            // devices whose kgsl node is unreadable.
+        }
         File override = new File(Environment.getExternalStorageDirectory(), OVERRIDE_FILE);
         String forced = override.isFile() ? FileUtils.readString(override) : null;
         if (forced != null) {

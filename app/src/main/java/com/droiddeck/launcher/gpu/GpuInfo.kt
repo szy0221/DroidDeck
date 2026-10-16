@@ -21,16 +21,22 @@ data class GpuInfo(
         A7XX("Adreno 7xx"),
         A6XX("Adreno 6xx"),
         ADRENO_UNKNOWN("Adreno"),
+        MALI("Mali / Immortalis"),
         NOT_ADRENO("Not an Adreno GPU");
 
-        fun label(context: Context): String = if (this == NOT_ADRENO) context.getString(R.string.gpuinfo_not_adreno) else label
+        fun label(context: Context): String = when (this) {
+            NOT_ADRENO -> context.getString(R.string.gpuinfo_not_adreno)
+            MALI -> context.getString(R.string.gpuinfo_mali)
+            else -> label
+        }
     }
 
-    enum class Support { TESTED, UNTESTED, UNSUPPORTED }
+    enum class Support { TESTED, UNTESTED, SOFTWARE, UNSUPPORTED }
 
     val support: Support
         get() = when {
             family == Family.NOT_ADRENO -> Support.UNSUPPORTED
+            family == Family.MALI -> Support.SOFTWARE
             family == Family.A6XX && model == 650 -> Support.TESTED
             family == Family.A8XX -> Support.TESTED
             family == Family.A7XX && model >= 725 -> Support.TESTED
@@ -42,12 +48,14 @@ data class GpuInfo(
             Support.TESTED -> "Supported"
             Support.UNTESTED -> if (family == Family.A7XX_LOW) "Experimental: its drivers are test builds"
                 else "Outside tested hardware (Adreno 650, 725 and newer): it may not run"
+            Support.SOFTWARE -> "Experimental: no Linux Vulkan driver for this GPU; games fall back to software rendering"
             Support.UNSUPPORTED -> "Not supported: DroidDeck needs an Adreno (Snapdragon) GPU"
         }
 
     fun supportText(context: Context): String = context.getString(when (support) {
         Support.TESTED -> R.string.gpuinfo_supported
         Support.UNTESTED -> if (family == Family.A7XX_LOW) R.string.gpuinfo_experimental else R.string.gpuinfo_below_tested
+        Support.SOFTWARE -> R.string.gpuinfo_software
         Support.UNSUPPORTED -> R.string.gpuinfo_unsupported
     })
 
@@ -71,15 +79,25 @@ data class GpuInfo(
                 fromPlatform > 0 -> "platform"
                 else -> ""
             }
-            val family = familyOf(adreno, model)
+            val vulkanDevice = if (adreno) "" else vulkanDeviceName()
+            val family = familyOf(adreno, model, vulkanDevice)
             val samsung = Build.MANUFACTURER.equals("samsung", ignoreCase = true)
             return GpuInfo(
-                name = if (!adreno) Build.HARDWARE.ifBlank { UNNAMED } else if (model > 0) "Adreno $model" else "Adreno",
+                name = when {
+                    adreno && model > 0 -> "Adreno $model"
+                    adreno -> "Adreno"
+                    vulkanDevice.isNotBlank() -> vulkanDevice
+                    else -> Build.HARDWARE.ifBlank { UNNAMED }
+                },
                 model = model, family = family, soc = soc,
                 oneUi8Gen2 = samsung && model == 740,
                 kgslName = raw.orEmpty(), modelSource = source,
             )
         }
+
+        fun vulkanDeviceName(): String =
+            (VulkanInfo.cachedOrNull() ?: runCatching { VulkanInfo.query() }.getOrNull())
+                ?.get("device")?.trim().orEmpty()
 
         internal fun threeDigits(text: String): Int = Regex("""(\d{3})""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
@@ -97,8 +115,10 @@ data class GpuInfo(
             ""
         }
 
-        internal fun familyOf(adreno: Boolean, model: Int): Family = when {
-            !adreno -> Family.NOT_ADRENO
+        internal fun familyOf(adreno: Boolean, model: Int): Family = familyOf(adreno, model, "")
+
+        internal fun familyOf(adreno: Boolean, model: Int, vulkanDevice: String): Family = when {
+            !adreno -> if (isMaliDevice(vulkanDevice)) Family.MALI else Family.NOT_ADRENO
             model == 0 -> Family.ADRENO_UNKNOWN
             model >= 800 -> Family.A8XX
             model in listOf(710, 720, 722) -> Family.A7XX_LOW
@@ -106,5 +126,31 @@ data class GpuInfo(
             model >= 600 -> Family.A6XX
             else -> Family.ADRENO_UNKNOWN
         }
+
+        internal fun isMali(vulkanDevice: String): Boolean {
+            val d = vulkanDevice.lowercase()
+            return d.contains("mali") || d.contains("immortalis")
+        }
+
+        /**
+         * The Vulkan device name is the clearest signal, but only when the
+         * Vulkan query itself succeeds. Every Mali device also exposes the HAL
+         * the loader is pointed at and the mali_kbase node, so fall back to
+         * those: a Xiaomi XRING O3 reports ro.hardware.vulkan=mali, ships
+         * vulkan.mali.so and has /dev/mali0, with no DRM render node.
+         */
+        internal fun isMaliDevice(vulkanDevice: String = vulkanDeviceName()): Boolean {
+            if (isMali(vulkanDevice)) return true
+            if (isMali(systemProperty("ro.hardware.vulkan"))) return true
+            if (MALI_HAL_PATHS.any { File(it).exists() }) return true
+            return File("/dev/mali0").exists()
+        }
+
+        private val MALI_HAL_PATHS = listOf(
+            "/vendor/lib64/hw/vulkan.mali.so",
+            "/vendor/lib/hw/vulkan.mali.so",
+            "/system/vendor/lib64/hw/vulkan.mali.so",
+            "/system/vendor/lib/hw/vulkan.mali.so",
+        )
     }
 }

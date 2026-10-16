@@ -209,11 +209,13 @@ internal fun SetupPanel(
                                 when (gpu.support) {
                                     com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_supported)
                                     com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested)
+                                    com.droiddeck.launcher.gpu.GpuInfo.Support.SOFTWARE -> stringResource(R.string.setup_gpu_software)
                                     else -> stringResource(R.string.setup_gpu_unsupported)
                                 },
                                 when (gpu.support) {
                                     com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_detail, gpu.displayName(ctx), gpuName)
                                     com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested_detail, gpu.displayName(ctx), gpu.supportText(ctx).replaceFirstChar { it.lowercase() })
+                                    com.droiddeck.launcher.gpu.GpuInfo.Support.SOFTWARE -> stringResource(R.string.setup_gpu_software_detail, gpu.displayName(ctx))
                                     else -> stringResource(R.string.setup_gpu_unsupported_detail, gpuName)
                                 },
                                 divider = divider,

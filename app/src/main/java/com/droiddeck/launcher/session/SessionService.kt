@@ -517,9 +517,17 @@ class SessionService : Service() {
         guest.add("WAYLAND_DISPLAY=wayland-0")
         guest.add("BL_ANDROID_CLIPBOARD=" + File(filesDir, "session/android-clipboard").path)
         guest.add("GAMESCOPE_FORCE_GENERAL_QUEUE=1")
-        guest.add("MESA_LOADER_DRIVER_OVERRIDE=zink")
-        guest.add("GALLIUM_DRIVER=zink")
-        guest.add("LIBGL_KOPPER_DRI2=true")
+        if (LinuxRuntime.hasAdreno()) {
+            guest.add("MESA_LOADER_DRIVER_OVERRIDE=zink")
+            guest.add("GALLIUM_DRIVER=zink")
+            guest.add("LIBGL_KOPPER_DRI2=true")
+        } else {
+            // zink is OpenGL on top of Vulkan. Without an Adreno there is no
+            // hardware Vulkan inside the guest, so pointing GL at it only adds a
+            // dependency on a device that is not there - use Mesa's software GL.
+            guest.add("GALLIUM_DRIVER=llvmpipe")
+            guest.add("LIBGL_ALWAYS_SOFTWARE=1")
+        }
         LinuxRuntime.vulkanIcd(this)?.let { guest.add("VK_ICD_FILENAMES=" + it.path) }
         val linuxDriverId = SessionPrefs.linuxDriver(this)
         LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)

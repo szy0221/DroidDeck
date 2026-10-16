@@ -127,7 +127,12 @@ object DeviceReport {
                 if (lm.isInstalled(id)) "" else "  [MISSING - falls back to the runtime's own]"
             k("Linux driver", label)
         }
-        k("Runtime's own ICD", LinuxRuntime.vulkanIcd(context)?.path)
+        k("Adreno (KGSL present)", LinuxRuntime.hasAdreno())
+        k("Runtime's own ICD", LinuxRuntime.vulkanIcd(context)?.path ?: "none usable - nothing is forced")
+        // Listing them all is what tells us whether a software driver (lavapipe)
+        // is actually there for a non-Adreno GPU to fall back to.
+        k("  ICDs in the runtime", LinuxRuntime.vulkanIcds(context)
+            .joinToString(", ") { it.name }.ifEmpty { "none" })
 
         h("Runtime")
         k("Installed version", LinuxRuntimeInstaller.installedVersion(context))

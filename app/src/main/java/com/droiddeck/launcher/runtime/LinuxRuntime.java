@@ -14,7 +14,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 
 public final class LinuxRuntime {
     public static final String DIR = "linuxfs";
@@ -77,14 +79,56 @@ public final class LinuxRuntime {
                 && prootLoader(context).isFile();
     }
 
+    /**
+     * The Vulkan ICD the guest should be pointed at.
+     *
+     * freedreno (Mesa's Adreno driver, Turnip) is the only driver that reaches the
+     * GPU on a Snapdragon, so it wins there. On anything else it still loads but
+     * enumerates no physical device, and gamescope dies with "failed to find
+     * physical device" before the session ever comes up - so on a non-Adreno GPU
+     * prefer the software rasteriser (lavapipe) when the runtime ships one, and
+     * otherwise hand back nothing: letting the loader scan is better than forcing
+     * a driver that cannot possibly work.
+     */
     public static File vulkanIcd(Context context) {
+        return vulkanIcd(context, hasAdreno());
+    }
+
+    static File vulkanIcd(Context context, boolean adreno) {
+        return pickIcd(vulkanIcds(context), adreno);
+    }
+
+    /** Visible for tests: the choice itself, with no Android types involved. */
+    static File pickIcd(File[] manifests, boolean adreno) {
+        if (manifests.length == 0) return null;
+        if (adreno) {
+            for (File manifest : manifests) {
+                if (manifest.getName().contains("freedreno")) return manifest;
+            }
+            return manifests[0];
+        }
+        for (File manifest : manifests) {
+            String name = manifest.getName().toLowerCase(Locale.ROOT);
+            if (name.contains("lvp") || name.contains("lavapipe") || name.contains("swiftshader")) return manifest;
+        }
+        for (File manifest : manifests) {
+            if (!manifest.getName().contains("freedreno")) return manifest;
+        }
+        return null;
+    }
+
+    /** Every ICD manifest the runtime ships, sorted so the pick is reproducible. */
+    public static File[] vulkanIcds(Context context) {
         File icdDir = new File(rootDir(context), "usr/share/vulkan/icd.d");
         File[] manifests = icdDir.listFiles((dir, name) -> name.endsWith(".json"));
-        if (manifests == null) return null;
-        for (File manifest : manifests) {
-            if (manifest.getName().contains("freedreno")) return manifest;
-        }
-        return manifests.length > 0 ? manifests[0] : null;
+        if (manifests == null) return new File[0];
+        Arrays.sort(manifests);
+        return manifests;
+    }
+
+    /** freedreno only reaches the GPU through KGSL, and KGSL is Qualcomm-only. */
+    public static boolean hasAdreno() {
+        return new File(KGSL_DEVICE).exists();
     }
 
     public static List<String> command(Context context, File sessionRoot, File runtimeDir,

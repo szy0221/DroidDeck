@@ -645,9 +645,11 @@
     <string name="setup_system_check">系统检查</string>
     <string name="setup_gpu_supported">设备受支持</string>
     <string name="setup_gpu_untested">未经测试的 GPU</string>
+    <string name="setup_gpu_software">实验性 GPU</string>
     <string name="setup_gpu_unsupported">GPU 不受支持</string>
     <string name="setup_gpu_detail">%1$s · %2$s</string>
     <string name="setup_gpu_untested_detail">%1$s：%2$s</string>
+    <string name="setup_gpu_software_detail">%1$s 没有 Linux Vulkan 驱动：Windows 游戏仍不可用，Steam 与桌面将以软件渲染运行</string>
     <string name="setup_gpu_unsupported_detail">Steam 需要 Adreno 驱动；%1$s 可能显示黑屏</string>
     <string name="setup_runtime">Linux 运行时</string>
     <string name="setup_runtime_progress">%1$s · %2$d%%</string>
@@ -1742,9 +1744,11 @@
     <string name="look_anime_edge_desc">卡通描边加锐化。</string>
 
     <string name="gpuinfo_not_adreno">不是 Adreno GPU</string>
+    <string name="gpuinfo_mali">Mali / Immortalis GPU</string>
     <string name="gpuinfo_supported">受支持</string>
     <string name="gpuinfo_experimental">实验性：其驱动为测试构建</string>
     <string name="gpuinfo_below_tested">低于已测试的硬件（Adreno 725 及更新）：可能无法运行</string>
+    <string name="gpuinfo_software">实验性：此 GPU 没有 Linux Vulkan 驱动，游戏将回退到软件渲染</string>
     <string name="gpuinfo_unsupported">不受支持：DroidDeck 需要 Adreno（骁龙）GPU</string>
 
     <string name="turnip_rate_limited">已达到 GitHub 的请求频率限制 — 请稍后重试</string>
@@ -1761,7 +1765,7 @@
     <string name="turnip_reject_library_missing">meta.json 指定了 %1$s，但它不在 zip 包中</string>
     <string name="turnip_reject_not_aarch64">%1$s 不是 64 位 AArch64 ELF 共享库</string>
     <string name="turnip_reject_glibc">%1$s 链接了 glibc — 这是“-Linux”Turnip，应在“运行时驱动”下导入</string>
-    <string name="lvd_no_library">此 zip 包中没有 libvulkan_freedreno*.so。Android（AdrenoTools）或 -Wayland Turnip zip 包不是 Linux 运行时驱动。</string>
+    <string name="lvd_no_library">此 zip 包中没有 libvulkan_*.so。Android（AdrenoTools）或 -Wayland Turnip zip 包不是 Linux 运行时驱动。</string>
     <string name="lvd_not_aarch64">%1$s 不是 64 位 AArch64 ELF 共享库。</string>
     <string name="lvd_not_glibc">%1$s 不是 glibc 驱动 — 它链接的是 Android 的 libc。Linux 运行时需要“-Linux”zip 包；普通或“-Wayland”Turnip 完全无法被 Steam 客户端加载。</string>
     <string name="bundle_no_manifest">不是驱动组合包：没有指定 Android 和 Linux 驱动的 manifest.json</string>
