@@ -1,8 +1,13 @@
 # Vulkan forwarding for non-Adreno GPUs (Mali / Immortalis / Xclipse)
 
-Status: design draft. Goal: make Windows games through Proton/DXVK run with
-hardware acceleration on devices whose GPU is not an Adreno (e.g. Xiaomi XRING
-O3 tablets with an Arm Mali/Immortalis GPU).
+Status: M1 done and verified in CI. Goal: make Windows games through
+Proton/DXVK run with hardware acceleration on devices whose GPU is not an
+Adreno (e.g. Xiaomi XRING O3 tablets with an Arm Mali/Immortalis GPU).
+
+M1 — plumbing — is complete: `vulkaninfo --summary` through the ICD reports the
+device behind the real driver (CI runs it against lavapipe on aarch64 and
+compares it against the same tool on the same driver untouched). What is left
+is M2, the rendering commands, and M3, gamescope.
 
 ## Measured device facts (Xiaomi XRING O3 tablet)
 
@@ -130,10 +135,14 @@ real Mali handle. Object creation returns a fresh id; destroy frees it.
 
 ## Milestones
 
-1. **M1 — plumbing**: stub + server, `vulkaninfo` inside the runtime reports
-   the Mali device (props/limits/features forwarded).
+1. **M1 — plumbing** (done): stub + server, `vulkaninfo` inside the runtime
+   reports the Mali device (props/limits/features forwarded). En route it also
+   needed images, because the tool creates one before it prints anything.
 2. **M2 — render**: `vkcube` (offscreen) through the stub; memory and sync
-   working.
+   working. This is where the anonymous-shared-fd and sync-object questions in
+   "Known hard parts" get answered, and it is the milestone the trace output
+   tells us what to build: every unimplemented core command it names is one
+   DXVK will reach for.
 3. **M3 — gamescope**: gamescope creates its Vulkan device through the stub;
    a native ARM64 Linux game renders.
 4. **M4 — DXVK**: Proton + DXVK game renders; measure FPS vs. software.

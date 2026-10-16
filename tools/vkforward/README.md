@@ -1,7 +1,9 @@
 # vkforward — Vulkan forwarding for non-Adreno GPUs
 
-`M1 status: implemented, verified by CI against lavapipe and ready for the
-device loopback (see "Verify on the tablet").`
+`M1 status: done. CI runs vulkaninfo through the ICD against lavapipe on
+aarch64, and against lavapipe untouched, and the two agree on the device.
+Images cross the socket too, which the tool needs before it prints anything.
+What is left is M2, the rendering commands.`
 
 Makes the Mali/Immortalis GPU usable from inside DroidDeck's proot Linux
 runtime by forwarding Vulkan calls to the vendor driver that already lives in
@@ -116,12 +118,30 @@ route B targets. Once up, the runtime's ICD reaches it on the abstract socket
 
 ### In the runtime
 
-Not wired up yet. This tree builds `libvulkan_vkforward.so` and its manifest;
-the next step drops those two files into the runtime image the way the
-lavapipe work does — as an overlay under `tools/linuxfs/overlay`, so the ICD
-lands at `/usr/local/lib` and its JSON in `/usr/share/vulkan/icd.d`. For a
-hand-rolled check in the meantime, push both into a running session and point
-`VK_ICD_FILENAMES` at the manifest.
+`vkforward-linux-aarch64.zip` is what the tablet gets. It holds
+`libvulkan_vkforward.so` and a `meta.json`, which is exactly the shape the
+app's "Linux Vulkan driver" import takes: it installs both, writes the ICD
+manifest itself and points the session at it. Nothing has to be rebuilt in
+the runtime and nothing has to be copied there by hand.
+
+Then, in DroidDeck, pick it as the Linux driver. The ICD on one side and the
+server on the other find each other over the abstract socket `vkforward`,
+which needs no mount, so a session that starts will use it.
+
+For a hand-rolled check the standalone `vkfw_server` binary and the ICD
+manifest work too:
+
+```bash
+# on the tablet, one shell for the server
+adb shell 'cd /data/local/tmp && VKFW_DRIVER=/vendor/lib64/hw/vulkan.mali.so ./vkfw_server'
+# and another for the client, inside the runtime
+VK_ICD_FILENAMES=/path/to/vkforward_icd.aarch64.json vulkaninfo --summary
+```
+
+Use an absolute path for the socket: Android shells have no `$TMPDIR`.
+`VKFW_TRACE=1` prints every exchange plus every entry point the ICD cannot
+serve, which on a tablet is the only debugger there is. It is verbose: the
+loader asks for several hundred names up front.
 
 ## M1 exit criterion
 
