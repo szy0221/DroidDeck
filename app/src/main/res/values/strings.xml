@@ -1107,6 +1107,9 @@
     <string name="second_hide_keyboard">Hide keyboard</string>
     <string name="second_terminal">Linux terminal</string>
     <string name="second_terminal_not_ready">The Linux session isn\'t ready for a terminal yet.</string>
+    <string name="second_terminal_on_this_screen">Linux terminal on this screen</string>
+    <string name="second_terminal_on_this_screen_hint">Opens a shell over the session, no second display needed.</string>
+    <string name="second_terminal_open">Open</string>
     <string name="rail_steam">Steam</string>
     <string name="rail_games">Games</string>
     <string name="rail_desktop">Desktop</string>

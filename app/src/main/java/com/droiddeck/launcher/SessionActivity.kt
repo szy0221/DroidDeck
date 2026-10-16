@@ -13,6 +13,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.app.Dialog
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -99,6 +100,7 @@ import com.droiddeck.launcher.ui.LoadingOverlay
 import com.droiddeck.launcher.ui.SessionDrawer
 import com.droiddeck.launcher.ui.SessionPausedOverlay
 import com.droiddeck.launcher.ui.SecondScreenPresentation
+import com.droiddeck.launcher.ui.TerminalPanel
 import com.droiddeck.launcher.ui.DroidDeckTheme
 import com.droiddeck.launcher.wayland.CompositorHost
 import com.droiddeck.launcher.wayland.WaylandCompositor
@@ -306,6 +308,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var started = false
     private lateinit var displayManager: DisplayManager
     private var secondScreenPresentation: SecondScreenPresentation? = null
+    private var onScreenTerminal: Dialog? = null
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = refreshSecondScreenDisplays()
         override fun onDisplayRemoved(displayId: Int) = refreshSecondScreenDisplays()
@@ -672,6 +675,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                     onFexPreset = { v -> SessionPrefs.setFexPreset(this@SessionActivity, v); readPrefs() },
                     onSecondScreenMode = ::selectSecondScreenMode,
                     onSecondScreenDisplay = ::selectSecondScreenDisplay,
+                    onOnScreenTerminal = ::openOnScreenTerminal,
                     onLaunchAndroidApp = { app, displayId ->
                         drawerOpen = false
                         try {
@@ -1845,6 +1849,12 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             return
         }
         if (secondScreenDisplays.isEmpty()) {
+            // No external display: a presentation is impossible, but the terminal
+            // does not need one - fall back to a panel on the device's own screen.
+            if (mode == SecondScreenMode.TERMINAL) {
+                openOnScreenTerminal()
+                return
+            }
             secondScreenMode = SecondScreenMode.NONE
             return
         }
@@ -1964,6 +1974,31 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             secondScreenMode = SecondScreenMode.NONE
             SessionState.secondScreenMode = SecondScreenMode.NONE
         }
+    }
+
+    /**
+     * The terminal used to live only inside a Presentation, and a Presentation
+     * needs an external display - so on a tablet with no second screen there was
+     * no way to reach a shell at all. Show the same panel on the device itself.
+     */
+    fun openOnScreenTerminal() {
+        if (!started) return
+        onScreenTerminal?.takeIf { it.isShowing }?.let { return }
+        val panel = TerminalPanel(this) { closeOnScreenTerminal() }
+        val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
+            setContentView(panel)
+            setCancelable(true)
+            setOnDismissListener { panel.stop() }
+        }
+        dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+        onScreenTerminal = dialog
+        dialog.show()
+        panel.start()
+    }
+
+    private fun closeOnScreenTerminal() {
+        onScreenTerminal?.takeIf { it.isShowing }?.dismiss()
+        onScreenTerminal = null
     }
 
     private fun effectiveTouchMode(): String {
@@ -2530,6 +2565,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         pendingBackAction?.let(uiHandler::removeCallbacks)
         pendingBackAction = null
         if (::pip.isInitialized) pip.destroyed()
+        closeOnScreenTerminal()
         closeSecondScreen(reset = false)
         if (::hud.isInitialized) hud.stop()
         padBridge?.stop()

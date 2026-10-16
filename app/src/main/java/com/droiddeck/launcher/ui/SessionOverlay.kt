@@ -249,6 +249,7 @@ class DrawerActions(
     val onTextureLodBias: (String?) -> Unit = {},
     val onSecondScreenMode: (SecondScreenMode) -> Unit,
     val onSecondScreenDisplay: (Int) -> Unit,
+    val onOnScreenTerminal: () -> Unit = {},
     val onLaunchAndroidApp: (HomeApp.LaunchableApp, Int?) -> Unit,
     val onBackground: () -> Unit,
     val pipSupported: Boolean = false,
@@ -962,6 +963,11 @@ private fun SecondScreenGroup(host: MenuHost, a: DrawerActions, track: (String) 
         if (a.secondScreenDisplays.size > 1) ChoiceRow(host, "second-screen-display", stringResource(R.string.drawer_page_display), null,
             a.secondScreenDisplays.map { it.id to it.label }, a.selectedSecondScreenDisplay,
             chipModifier = track("second-screen-display"), onPick = a.onSecondScreenDisplay)
+        // A presentation needs an external display; without one the terminal used
+        // to be unreachable, so offer it as an overlay on the device's own screen.
+        ActionRow(stringResource(R.string.second_terminal_on_this_screen),
+            stringResource(R.string.second_terminal_on_this_screen_hint),
+            stringResource(R.string.second_terminal_open), { host.open = null; a.onOnScreenTerminal() })
     }
 }
 

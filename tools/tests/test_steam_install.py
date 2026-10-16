@@ -26,10 +26,22 @@ class SteamInstallTest(unittest.TestCase):
         self.bin = self.root / 'bin'
         self.bin.mkdir()
         curl = self.bin / 'curl'
+        # Finds the URL and the -o target by name instead of by position, so the
+        # script can pass curl whatever options it needs.
         curl.write_text('''#!/bin/bash
 set -eu
-printf '%s\\n' "$2" >> "$TEST_REQUESTS"
-cp "$TEST_CDN/${2##*/}" "$4"
+url=
+dest=
+prev=
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then dest=$arg; fi
+  case $arg in
+    http://*|https://*) url=$arg ;;
+  esac
+  prev=$arg
+done
+printf '%s\\n' "$url" >> "$TEST_REQUESTS"
+cp "$TEST_CDN/${url##*/}" "$dest"
 ''')
         curl.chmod(0o755)
         if shutil.which('sha256sum') is None:

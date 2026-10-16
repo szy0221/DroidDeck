@@ -1063,6 +1063,9 @@
     <string name="second_hide_keyboard">隐藏键盘</string>
     <string name="second_terminal">Linux 终端</string>
     <string name="second_terminal_not_ready">Linux 会话尚未准备好使用终端。</string>
+    <string name="second_terminal_on_this_screen">在本机屏幕打开 Linux 终端</string>
+    <string name="second_terminal_on_this_screen_hint">直接在本机屏幕上打开一个会话 shell，无需外接第二屏。</string>
+    <string name="second_terminal_open">打开</string>
     <string name="rail_steam">Steam</string>
     <string name="rail_games">游戏</string>
     <string name="rail_desktop">桌面</string>

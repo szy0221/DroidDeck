@@ -1,6 +1,10 @@
 #!/bin/bash
 set -eu
-cdn=https://client-update.fastly.steamstatic.com
+cdn=${DROIDDECK_STEAM_CDN:-https://client-update.fastly.steamstatic.com}
+cdn_hosts="$cdn
+https://media.steamstatic.com
+https://steamcdn-a.akamaihd.net
+https://client-update.akamaihd.net"
 steam_channel=steamdeck_publicbeta
 manifest=steam_client_${steam_channel}_linuxarm64
 steam_root=${XDG_DATA_HOME:-$HOME/.local/share}/Steam
@@ -20,6 +24,9 @@ elif [ -f "$unconfirmed" ] && ! grep -qx repaired "$unconfirmed" \
 fi
 if [ -n "$repair" ]; then
   echo "== STEP $(date -u +%H:%M:%S) repairing the Steam client ($repair)"
+  # The cached archives are suspect too - otherwise a repair would happily
+  # reinstall the very bytes that just failed to start.
+  rm -f "$steam_root"/package/droiddeck-cache/*
   rm -f "$stamp" "$legacy_stamp" "$steam_root/.crash" "$steam_root/steam.pid" \
     "$steam_root"/package/steam_client_*.manifest "$steam_root"/package/steam_client_*.installed
   for part in "$steam_root"/package/*.zip.*; do
@@ -35,9 +42,46 @@ if [ -n "$repair" ]; then
 fi
 [ -x "$steam_root/steamrtarm64/steam" ] && [ -f "$stamp" ] && exit 0
 
+# fetch <path> <dest> [sha256]
+#
+# Walks every known Steam CDN in turn and keeps what it already has, because the
+# client is several hundred MB and one dropped TLS connection - routine behind a
+# VPN or an unreliable link - used to abort the whole session and drop the user
+# back to the launcher. Returns only when the checksum matches.
+fetch() {
+  local path=$1 dest=$2 want=${3:-} host url attempt rc
+  mkdir -p "$(dirname "$dest")"
+  for attempt in 1 2 3; do
+    for host in $cdn_hosts; do
+      url=$host/$path
+      [ -f "$dest" ] || : > "$dest"
+      if ! curl -fSL --retry 3 --retry-delay 2 \
+          --connect-timeout 20 --max-time 900 --speed-time 60 --speed-limit 1024 \
+          -C - "$url" -o "$dest" 2>"$dest.log"; then
+        rc=$?
+        echo "== STEP $(date -u +%H:%M:%S) ${host#https://} attempt $attempt failed (curl $rc: $(tail -1 "$dest.log"))"
+      fi
+      if [ -z "$want" ] && [ -s "$dest" ]; then rm -f "$dest.log"; return 0; fi
+      if [ -n "$want" ] && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$want" ]; then
+        rm -f "$dest.log"
+        return 0
+      fi
+      # Wrong bytes: a resumed file from an older client, or a mirror serving
+      # something else. Drop it so the next attempt really starts over.
+      rm -f "$dest"
+    done
+    sleep $((attempt * 3))
+  done
+  rm -f "$dest.log"
+  return 1
+}
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-curl -fsSL "$cdn/$manifest" -o "$work/manifest"
+fetch "$manifest" "$work/manifest" || {
+  echo "droiddeck-steam-install: could not download the client manifest" >&2
+  exit 1
+}
 version=$(awk -F'"' '$2 == "version" { print $4; exit }' "$work/manifest")
 awk -F'"' '
   /^\t"/ && NF >= 3 && $4 == "" { block = $2 }
@@ -49,13 +93,22 @@ awk -F'"' '
 total=$(grep -c . "$work/parts" 2>/dev/null || echo 0)
 
 mkdir -p "$steam_root/package"
+# Kept between runs: a session that dies half way through can pick up where it
+# stopped instead of pulling several hundred MB again from zero.
+cache=$steam_root/package/droiddeck-cache
+mkdir -p "$cache"
 while read -r block file sum; do
   i=$((${i:-0} + 1))
-  echo "== STEP $(date -u +%H:%M:%S) downloading Steam: $block ($i/$total)"
-  curl -fsSL "$cdn/$file" -o "$work/$file"
-  echo "$sum  $work/$file" | sha256sum -c --quiet
-  unzip -qo "$work/$file" -d "$steam_root"
-  rm -f "$work/$file"
+  if [ -f "$cache/$file" ] && [ "$(sha256sum "$cache/$file" | cut -d' ' -f1)" = "$sum" ]; then
+    echo "== STEP $(date -u +%H:%M:%S) already downloaded Steam: $block ($i/$total)"
+  else
+    echo "== STEP $(date -u +%H:%M:%S) downloading Steam: $block ($i/$total)"
+    fetch "$file" "$cache/$file" "$sum" || {
+      echo "droiddeck-steam-install: could not download $file" >&2
+      exit 1
+    }
+  fi
+  unzip -qo "$cache/$file" -d "$steam_root"
 done < "$work/parts"
 find "$steam_root" -depth -name '*\\*' | while read -r odd; do
   fixed=${odd//\\//}
