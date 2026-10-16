@@ -37,6 +37,7 @@ enum {
     VKFW_TYPE_PHYSICAL_DEVICE,
     VKFW_TYPE_DEVICE,
     VKFW_TYPE_QUEUE,
+    VKFW_TYPE_IMAGE,
 };
 
 /* Cached children so repeated queries return identical handles. */
@@ -1218,6 +1219,142 @@ static void vkfw_vkGetDeviceQueue(VkDevice device, uint32_t familyIndex, uint32_
     *pQueue = (VkQueue)vkfw_cache_insert(&dev->children, 0, familyIndex, queueIndex, obj);
 }
 
+/* ---- images ------------------------------------------------------------- */
+
+/* Images are the first non-dispatchable objects on the wire. The create info
+ * arrives as a struct with both of its pointers cleared and its queue family
+ * array sent alongside, because a pointer into this process is a wild one in
+ * the other; the server rebuilds the array there. */
+static VkResult vkfw_vkCreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
+                                   const VkAllocationCallbacks *pAllocator, VkImage *pImage)
+{
+    (void)pAllocator;
+    if (!pImage || !pCreateInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *pImage = VK_NULL_HANDLE;
+    struct vkfw_device *dev = vkfw_as_device(device);
+    if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    VkImageCreateInfo info = *pCreateInfo;
+    info.pNext = NULL;
+    info.pQueueFamilyIndices = NULL;
+    uint32_t qf_count = pCreateInfo->pQueueFamilyIndices ? pCreateInfo->queueFamilyIndexCount : 0;
+    vkfw_buf_put(&req, &info, sizeof(info));
+    vkfw_buf_put_u32(&req, qf_count);
+    for (uint32_t i = 0; i < qf_count; i++)
+        vkfw_buf_put_u32(&req, pCreateInfo->pQueueFamilyIndices[i]);
+
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_CREATE_IMAGE, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    if (rc != VK_SUCCESS) {
+        vkfw_buf_free(&reply);
+        return VK_ERROR_OUT_OF_HOST_MEMORY == rc ? rc : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    uint64_t id = 0;
+    if (!vkfw_cur_u64(&body, &id)) {
+        vkfw_buf_free(&reply);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    vkfw_buf_free(&reply);
+
+    struct vkfw_object *obj = calloc(1, sizeof(*obj));
+    if (!obj) {
+        /* Created on the server but unreachable here: undo it rather than
+         * leak a driver-side image for the rest of the session. */
+        vkfw_buf undo;
+        vkfw_buf_init(&undo);
+        vkfw_buf_put_u64(&undo, id);
+        vkfw_buf confirm;
+        vkfw_invoke(VKFW_CMD_DESTROY_IMAGE, &undo, &confirm);
+        vkfw_buf_free(&undo);
+        vkfw_buf_free(&confirm);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    vkfw_obj_init(obj, VKFW_TYPE_IMAGE, id);
+    *pImage = (VkImage)obj;
+    return VK_SUCCESS;
+}
+
+static void vkfw_vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks *pAllocator)
+{
+    (void)device;
+    (void)pAllocator;
+    struct vkfw_object *obj = (struct vkfw_object *)image;
+    if (!obj || obj->type != VKFW_TYPE_IMAGE) return;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, obj->id);
+    vkfw_buf reply;
+    vkfw_invoke(VKFW_CMD_DESTROY_IMAGE, &req, &reply);
+    vkfw_buf_free(&req);
+    vkfw_buf_free(&reply);
+    free(obj);
+}
+
+static void vkfw_vkGetImageMemoryRequirements(VkDevice device, VkImage image,
+                                              VkMemoryRequirements *pMemoryRequirements)
+{
+    struct vkfw_device *dev = vkfw_as_device(device);
+    struct vkfw_object *obj = (struct vkfw_object *)image;
+    if (!pMemoryRequirements || !dev || !obj || obj->type != VKFW_TYPE_IMAGE) return;
+    memset(pMemoryRequirements, 0, sizeof(*pMemoryRequirements));
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    vkfw_buf_put_u64(&req, obj->id);
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_GET_IMAGE_MEMORY_REQUIREMENTS, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    if (rc == VK_SUCCESS) vkfw_cur_bytes(&body, pMemoryRequirements, sizeof(*pMemoryRequirements));
+    vkfw_buf_free(&reply);
+}
+
+static void vkfw_vkGetImageSparseMemoryRequirements(VkDevice device, VkImage image,
+                                                    uint32_t *pSparseMemoryRequirementCount,
+                                                    VkSparseImageMemoryRequirements *pSparseMemoryRequirements)
+{
+    struct vkfw_device *dev = vkfw_as_device(device);
+    struct vkfw_object *obj = (struct vkfw_object *)image;
+    if (!pSparseMemoryRequirementCount || !dev || !obj || obj->type != VKFW_TYPE_IMAGE) return;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    vkfw_buf_put_u64(&req, obj->id);
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    if (rc != VK_SUCCESS) {
+        vkfw_buf_free(&reply);
+        *pSparseMemoryRequirementCount = 0;
+        return;
+    }
+    uint32_t count = 0;
+    vkfw_cur_u32(&body, &count);
+    if (!pSparseMemoryRequirements) {
+        *pSparseMemoryRequirementCount = count;
+        vkfw_buf_free(&reply);
+        return;
+    }
+    uint32_t wrote = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        VkSparseImageMemoryRequirements one;
+        if (!vkfw_cur_bytes(&body, &one, sizeof(one))) break;
+        if (i >= *pSparseMemoryRequirementCount) continue;
+        pSparseMemoryRequirements[wrote++] = one;
+    }
+    *pSparseMemoryRequirementCount = wrote;
+    vkfw_buf_free(&reply);
+}
+
 /* ---- dispatchables ------------------------------------------------------ */
 
 /* Set VKFW_TRACE=1 to log the entry points we cannot serve. Those are exactly
@@ -1342,6 +1479,10 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetInstanceProcAddr(VkIns
     ENTRY(vkGetDeviceProcAddr);
     ENTRY(vkGetDeviceQueue);
     ENTRY(vkDeviceWaitIdle);
+    ENTRY(vkCreateImage);
+    ENTRY(vkDestroyImage);
+    ENTRY(vkGetImageMemoryRequirements);
+    ENTRY(vkGetImageSparseMemoryRequirements);
 #undef ENTRY
 #undef ALIAS
     return vkfw_absent("instance", pName);
@@ -1359,6 +1500,10 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetDeviceProcAddr(VkDevic
     ENTRY(vkDestroyDevice);
     ENTRY(vkGetDeviceQueue);
     ENTRY(vkDeviceWaitIdle);
+    ENTRY(vkCreateImage);
+    ENTRY(vkDestroyImage);
+    ENTRY(vkGetImageMemoryRequirements);
+    ENTRY(vkGetImageSparseMemoryRequirements);
 #undef ENTRY
 #undef ALIAS
     return vkfw_absent("device", pName);

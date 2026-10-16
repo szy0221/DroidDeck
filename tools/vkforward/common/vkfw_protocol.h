@@ -88,6 +88,7 @@ struct vkfw_header {
     X(CREATE_IMAGE, )                                                          \
     X(DESTROY_IMAGE, )                                                         \
     X(GET_IMAGE_MEMORY_REQUIREMENTS, )                                         \
+    X(GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS, )                                  \
     X(BIND_IMAGE_MEMORY, )                                                     \
     X(CREATE_FENCE, = 100)                                                     \
     X(DESTROY_FENCE, )                                                         \

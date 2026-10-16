@@ -109,6 +109,7 @@ enum vkfw_handle_type {
     VKFW_OBJ_PHYSICAL_DEVICE,
     VKFW_OBJ_DEVICE,
     VKFW_OBJ_QUEUE,
+    VKFW_OBJ_IMAGE,
 };
 
 struct vkfw_handle_slot {
@@ -1047,6 +1048,146 @@ static void h_device_wait_idle(struct vkfw_request *req, void *unused)
     vkfw_buf_put_result(req->out, fn(device));
 }
 
+/* ---- images ------------------------------------------------------------- */
+
+/*
+ * VkImageCreateInfo holds two pointers: the pNext chain and the queue family
+ * index array. The ICD sends the struct with both cleared and hands over the
+ * array separately, so what the driver sees is a struct whose every pointer
+ * was made here.
+ */
+static VkResult vkfw_image_create_info(struct vkfw_request *req, VkImageCreateInfo *info)
+{
+    if (!vkfw_cur_bytes(&req->in, info, sizeof(*info))) return VKFW_ERR_PROTOCOL;
+    info->pNext = NULL;
+    uint32_t count = 0;
+    if (!vkfw_cur_u32(&req->in, &count)) return VKFW_ERR_PROTOCOL;
+    if (count > 64) return VKFW_ERR_PROTOCOL;
+    if (count == 0) {
+        info->queueFamilyIndexCount = 0;
+        info->pQueueFamilyIndices = NULL;
+        return VK_SUCCESS;
+    }
+    uint32_t *indices = calloc(count, sizeof(*indices));
+    if (!indices) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!vkfw_cur_u32(&req->in, &indices[i])) {
+            free(indices);
+            return VKFW_ERR_PROTOCOL;
+        }
+    }
+    info->queueFamilyIndexCount = count;
+    info->pQueueFamilyIndices = indices;
+    return VK_SUCCESS;
+}
+
+static void h_create_image(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id)) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    PFN_vkCreateImage fn =
+        (PFN_vkCreateImage)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id), "vkCreateImage");
+    if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+
+    VkImageCreateInfo info;
+    VkResult r = vkfw_image_create_info(req, &info);
+    if (r != VK_SUCCESS) { vkfw_buf_put_result(req->out, r); return; }
+
+    VkImage image = VK_NULL_HANDLE;
+    r = fn(device, &info, NULL, &image);
+    free((void *)info.pQueueFamilyIndices);
+    if (r != VK_SUCCESS) { vkfw_buf_put_result(req->out, r); return; }
+
+    uint64_t id = vkfw_handle_add(&req->conn->handles, VKFW_OBJ_IMAGE, image, dev_id);
+    if (id == 0) {
+        PFN_vkDestroyImage destroy =
+            (PFN_vkDestroyImage)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id), "vkDestroyImage");
+        if (destroy) destroy(device, image, NULL);
+        vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY);
+        return;
+    }
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+    vkfw_buf_put_u64(req->out, id);
+}
+
+static void h_destroy_image(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t id = 0;
+    if (!vkfw_cur_u64(&req->in, &id)) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+    if (id == 0 || id > req->conn->handles.count) {
+        vkfw_buf_put_result(req->out, VK_SUCCESS);
+        return;
+    }
+    VkImage image = (VkImage)vkfw_handle_get(&req->conn->handles, id, VKFW_OBJ_IMAGE);
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles,
+                                                req->conn->handles.v[id - 1].owner, VKFW_OBJ_DEVICE);
+    if (device && image) {
+        PFN_vkDestroyImage fn =
+            (PFN_vkDestroyImage)vkfw_instance_proc(vkfw_instance_of(req->conn, id), "vkDestroyImage");
+        if (fn) fn(device, image, NULL);
+    }
+    vkfw_handle_drop(&req->conn->handles, id);
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+}
+
+static void h_get_image_memory_requirements(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0, img_id = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u64(&req->in, &img_id)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    VkImage image = (VkImage)vkfw_handle_get(&req->conn->handles, img_id, VKFW_OBJ_IMAGE);
+    PFN_vkGetImageMemoryRequirements fn =
+        (PFN_vkGetImageMemoryRequirements)vkfw_instance_proc(vkfw_instance_of(req->conn, img_id),
+                                                             "vkGetImageMemoryRequirements");
+    if (!device || !image || !fn) {
+        vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    VkMemoryRequirements needs;
+    memset(&needs, 0, sizeof(needs));
+    fn(device, image, &needs);
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+    vkfw_buf_put(req->out, &needs, sizeof(needs));
+}
+
+static void h_get_image_sparse_memory_requirements(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0, img_id = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u64(&req->in, &img_id)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    VkImage image = (VkImage)vkfw_handle_get(&req->conn->handles, img_id, VKFW_OBJ_IMAGE);
+    PFN_vkGetImageSparseMemoryRequirements fn =
+        (PFN_vkGetImageSparseMemoryRequirements)vkfw_instance_proc(
+            vkfw_instance_of(req->conn, img_id), "vkGetImageSparseMemoryRequirements");
+    if (!device || !image || !fn) {
+        vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    uint32_t count = 0;
+    fn(device, image, &count, NULL);
+    VkSparseImageMemoryRequirements *reqs = NULL;
+    if (count > 0) {
+        reqs = calloc(count, sizeof(*reqs));
+        if (!reqs) { vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY); return; }
+        fn(device, image, &count, reqs);
+    }
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+    vkfw_buf_put_u32(req->out, count);
+    for (uint32_t i = 0; i < count; i++) vkfw_buf_put(req->out, &reqs[i], sizeof(reqs[i]));
+    free(reqs);
+}
+
 /* ---- dispatch ----------------------------------------------------------- */
 
 struct vkfw_entry {
@@ -1088,6 +1229,11 @@ static const struct vkfw_entry kDispatch[] = {
     { VKFW_CMD_DESTROY_DEVICE, h_destroy_device, NULL },
     { VKFW_CMD_GET_DEVICE_QUEUE, h_get_device_queue, NULL },
     { VKFW_CMD_DEVICE_WAIT_IDLE, h_device_wait_idle, NULL },
+
+    { VKFW_CMD_CREATE_IMAGE, h_create_image, NULL },
+    { VKFW_CMD_DESTROY_IMAGE, h_destroy_image, NULL },
+    { VKFW_CMD_GET_IMAGE_MEMORY_REQUIREMENTS, h_get_image_memory_requirements, NULL },
+    { VKFW_CMD_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS, h_get_image_sparse_memory_requirements, NULL },
 };
 
 void vkfw_serve_connection(int fd)

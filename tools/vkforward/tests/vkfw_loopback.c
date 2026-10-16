@@ -46,6 +46,62 @@ static void *accept_thread(void *p)
 
 static void dump_device_extensions(PFN_vkEnumerateDeviceExtensionProperties fn, VkPhysicalDevice pd);
 
+/* Images are the first non-dispatchable objects to cross the socket, and the
+ * first whose create info carries pointers of its own. Creating one, asking
+ * what it needs and destroying it is the shape every later resource takes. */
+static int image_round_trip(PFN_vkGetInstanceProcAddr gipa, VkDevice device)
+{
+    PFN_vkCreateImage create_image = (PFN_vkCreateImage)gipa(NULL, "vkCreateImage");
+    PFN_vkDestroyImage destroy_image = (PFN_vkDestroyImage)gipa(NULL, "vkDestroyImage");
+    PFN_vkGetImageMemoryRequirements needs =
+        (PFN_vkGetImageMemoryRequirements)gipa(NULL, "vkGetImageMemoryRequirements");
+    PFN_vkGetImageSparseMemoryRequirements sparse =
+        (PFN_vkGetImageSparseMemoryRequirements)gipa(NULL, "vkGetImageSparseMemoryRequirements");
+    if (!create_image || !destroy_image || !needs) return 1;
+
+    VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.extent.width = 64;
+    ici.extent.height = 64;
+    ici.extent.depth = 1;
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkImage image = VK_NULL_HANDLE;
+    VkResult r = create_image(device, &ici, NULL, &image);
+    printf("[images] vkCreateImage 64x64 R8G8B8A8: %d\n", r);
+    if (r != VK_SUCCESS || !image) return 1;
+
+    int failures = 0;
+    VkMemoryRequirements mem;
+    memset(&mem, 0, sizeof(mem));
+    needs(device, image, &mem);
+    printf("[images] memory: size=%llu alignment=%llu types=0x%x\n",
+           (unsigned long long)mem.size, (unsigned long long)mem.alignment, mem.memoryTypeBits);
+    if (mem.size == 0 || mem.alignment == 0 || mem.memoryTypeBits == 0) failures++;
+
+    if (sparse) {
+        uint32_t count = 0;
+        sparse(device, image, &count, NULL);
+        VkSparseImageMemoryRequirements *reqs = count ? calloc(count, sizeof(*reqs)) : NULL;
+        if (count) {
+            sparse(device, image, &count, reqs);
+            printf("[images] sparse requirements: %u\n", count);
+        }
+        free(reqs);
+    }
+
+    destroy_image(device, image, NULL);
+    printf("[images] destroyed\n");
+    return failures;
+}
+
 /* Phase 2 does what a real Vulkan tool does: enables every reported extension
  * and walks the long pNext chains (the VkPhysicalDeviceVulkan1x* structs) that
  * vulkaninfo relies on. Anything wrong in the chain marshalling shows up here,
@@ -370,6 +426,7 @@ int main(int argc, char **argv)
             if (get_queue) get_queue(device, graphics_family, 0, &queue);
             printf("vkGetDeviceQueue: %s\n", queue ? "OK" : "FAILED");
             if (!queue) failures++;
+            failures += image_round_trip(gipa, device);
             PFN_vkDestroyDevice destroy_dev = (PFN_vkDestroyDevice)gipa(instance, "vkDestroyDevice");
             if (destroy_dev) destroy_dev(device, NULL);
         }
