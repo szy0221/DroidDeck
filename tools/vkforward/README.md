@@ -49,13 +49,21 @@ generated table in `common/vkfw_pnext_sizes.c`, so the two ends agree even when
 toolchains differ; every rebuilt pNext node still gets a 128-byte zero tail so a
 driver built against newer headers cannot read past a node we own.
 
-Regenerate the table when the Vulkan headers move:
+Regenerate the table when the Vulkan headers move. It needs a 64-bit C
+compiler to measure the sizes, and a Vulkan-Headers tree rather than an NDK
+sysroot (bionic's headers will not compile anywhere but under the NDK):
 
 ```bash
-python3 scripts/gen_pnext_table.py \
-    "$ANDROID_HOME/ndk/27.3.13750724/toolchains/llvm/prebuilt/*/sysroot/usr/include/vulkan/vulkan_core.h" \
-    common
+python3 scripts/gen_pnext_table.py <Vulkan-Headers>/include/vulkan/vulkan_core.h common cc
 ```
+
+The committed table stores the sizes as numbers, not as `sizeof(...)`
+expressions, so it compiles under any Vulkan headers at all: an NDK or
+distro header bump renames and drops structs freely, and none of that has
+any say over this file. Vulkan structs are append-only, which is why the
+version they were measured at does not have to match the one the ICD is
+built against — measuring 1.3.275 and 1.4.309 gives identical sizes for
+every struct they share.
 
 ## Wire format
 

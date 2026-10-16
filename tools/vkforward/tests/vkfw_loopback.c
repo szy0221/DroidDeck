@@ -57,6 +57,7 @@ static int tool_style_sweep(PFN_vkGetInstanceProcAddr gipa)
     PFN_vkCreateInstance create = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
     PFN_vkDestroyInstance destroy_inst = (PFN_vkDestroyInstance)gipa(NULL, "vkDestroyInstance");
     if (!enum_inst_ext || !create) return 1;
+    int failures = 0;
 
     uint32_t count = 0;
     enum_inst_ext(NULL, &count, NULL);
@@ -120,6 +121,18 @@ static int tool_style_sweep(PFN_vkGetInstanceProcAddr gipa)
         printf("[tool sweep] %s: updateAfterBind=%u subgroupSize=%u driverID=%d\n",
                p2.properties.deviceName, v12.robustBufferAccessUpdateAfterBind, v11.subgroupSize, driver.driverID);
 
+        /*
+         * The links are the caller's, and the server has addresses of its
+         * own. In one process a leaked server pointer still dereferences,
+         * so the sweep would pass and the tablet would crash: check the
+         * links are the ones we laid down, not merely plausible.
+         */
+        if (p2.pNext != &maint3 || maint3.pNext != &driver || driver.pNext != &v11 ||
+            v11.pNext != &v12 || v12.pNext != &v13 || v13.pNext != NULL) {
+            printf("[tool sweep] FAIL: Properties2 rewrote the caller's pNext links\n");
+            failures++;
+        }
+
         VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
         VkPhysicalDeviceVulkan12Features f12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
         VkPhysicalDeviceVulkan11Features f11 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
@@ -176,8 +189,8 @@ static int tool_style_sweep(PFN_vkGetInstanceProcAddr gipa)
     free(exts);
     free(names);
     if (destroy_inst) destroy_inst(instance, NULL);
-    printf("[tool sweep] done\n");
-    return 0;
+    printf("[tool sweep] %s\n", failures == 0 ? "done" : "done, with failures");
+    return failures == 0 ? 0 : 1;
 }
 
 static void dump_device_extensions(PFN_vkEnumerateDeviceExtensionProperties fn, VkPhysicalDevice pd)

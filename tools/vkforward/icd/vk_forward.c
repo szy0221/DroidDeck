@@ -460,16 +460,26 @@ static VkResult vkfw_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32
         VkPhysicalDeviceGroupProperties *dst = &pProperties[wrote++];
         memset(dst, 0, sizeof(*dst));
         dst->subsetAllocation = subset;
-        for (uint32_t d = 0; d < device_count && d < VK_MAX_DEVICE_GROUP_SIZE; d++) {
+        for (uint32_t d = 0; d < device_count; d++) {
             uint64_t id = 0;
+            /* Past the array the ids are still in the reply: leave them there
+             * and every group after this one reads the previous group's tail.
+             */
             if (!vkfw_cur_u64(&body, &id)) { result = VK_ERROR_INITIALIZATION_FAILED; break; }
+            if (d >= VK_MAX_DEVICE_GROUP_SIZE) continue;
             void *cached = vkfw_cache_lookup(inst->children, id, d, 0);
             struct vkfw_object *obj = cached;
             if (!obj) {
                 obj = calloc(1, sizeof(*obj));
                 if (!obj) { result = VK_ERROR_OUT_OF_HOST_MEMORY; break; }
                 vkfw_obj_init(obj, VKFW_TYPE_PHYSICAL_DEVICE, id);
-                obj = vkfw_cache_insert(&inst->children, id, d, 0, obj);
+                void *inserted = vkfw_cache_insert(&inst->children, id, d, 0, obj);
+                if (!inserted) {
+                    free(obj);
+                    result = VK_ERROR_OUT_OF_HOST_MEMORY;
+                    break;
+                }
+                obj = inserted;
             }
             dst->physicalDevices[d] = (VkPhysicalDevice)obj;
             dst->physicalDeviceCount++;

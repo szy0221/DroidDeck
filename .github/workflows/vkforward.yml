@@ -64,7 +64,7 @@ jobs:
       - name: Sanity check, vulkaninfo talks to the driver without us
         run: |
           set -euxo pipefail
-          VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json \
+          VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
             vulkaninfo --summary | tee "$RUNNER_TEMP/vulkaninfo-native.txt"
           grep -qi 'llvmpipe\|lavapipe' "$RUNNER_TEMP/vulkaninfo-native.txt"
 

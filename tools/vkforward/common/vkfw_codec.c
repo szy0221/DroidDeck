@@ -2,6 +2,7 @@
 #include "vkfw_protocol.h"
 #include "vkfw_pnext_sizes.h"
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -175,7 +176,8 @@ bool vkfw_chain_collect(const void *head, vkfw_chain *out)
          n = (const struct vkfw_any_struct *)n->pNext) {
         size_t node_size = vkfw_pnext_size(n->sType);
         if (node_size == 0) continue; /* unknown to our table: cannot forward it safely */
-        if (node_size > VKFW_MAX_CHAIN_NODE_BYTES) continue;
+        if (node_size < sizeof(struct vkfw_any_struct) || node_size > VKFW_MAX_CHAIN_NODE_BYTES)
+            continue;
         if (out->count == VKFW_MAX_CHAIN_NODES) {
             free(v);
             return false;
@@ -207,9 +209,22 @@ void vkfw_chain_put(vkfw_buf *b, const vkfw_chain *c)
 {
     vkfw_buf_put_u32(b, c->count);
     for (uint32_t i = 0; i < c->count; i++) {
+        const uint8_t *node = (const uint8_t *)c->v[i].node;
+        size_t size = c->v[i].size;
         vkfw_buf_put_u32(b, c->v[i].sType);
-        vkfw_buf_put_u32(b, (uint32_t)c->v[i].size);
-        vkfw_buf_put(b, c->v[i].node, c->v[i].size);
+        vkfw_buf_put_u32(b, (uint32_t)size);
+        /*
+         * A pNext is a pointer into whoever owns the chain, and these structs
+         * travel to a process that has its own addresses. Sending one would
+         * hand the other side a pointer that means nothing there: the ICD
+         * would then write it into the caller's node, and the next walk of
+         * that chain would follow an address from a foreign heap. The link is
+         * rebuilt from the order on arrival instead, so it never crosses.
+         */
+        vkfw_buf_put(b, node, offsetof(struct vkfw_any_struct, pNext));
+        vkfw_buf_put_u64(b, 0);
+        vkfw_buf_put(b, node + offsetof(struct vkfw_any_struct, pNext) + sizeof(void *),
+                     size - offsetof(struct vkfw_any_struct, pNext) - sizeof(void *));
     }
 }
 
@@ -268,8 +283,13 @@ bool vkfw_chain_apply(vkfw_cur *c, void *client_head)
     }
     uint32_t n = peers.count < mine.count ? peers.count : mine.count;
     for (uint32_t i = 0; i < n; i++) {
+        struct vkfw_any_struct *dst = (struct vkfw_any_struct *)mine.v[i].node;
+        void *keep = dst->pNext;
         size_t copy = peers.v[i].size < mine.v[i].size ? peers.v[i].size : mine.v[i].size;
-        memcpy(mine.v[i].node, peers.v[i].node, copy);
+        memcpy(dst, peers.v[i].node, copy);
+        /* The link belongs to the caller, whose chain may hold nodes we did
+         * not forward; the incoming copy has no say in it. */
+        dst->pNext = keep;
     }
     vkfw_chain_free(&mine);
     vkfw_chain_free(&peers);

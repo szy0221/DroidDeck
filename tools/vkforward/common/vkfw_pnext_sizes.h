@@ -1,12 +1,12 @@
 /* GENERATED FILE - do not edit. Regenerate with scripts/gen_pnext_table.py */
-/* Source: Vulkan headers VK_HEADER_VERSION 275 */
+/* Source: Vulkan headers VK_HEADER_VERSION 309, LP64 sizes */
 #ifndef VKFW_PNEXT_SIZES_H
 #define VKFW_PNEXT_SIZES_H
 
 #include <stddef.h>
 #include <stdint.h>
 
-#define VKFW_PNEXT_TABLE_HEADER_VERSION 275
+#define VKFW_PNEXT_TABLE_HEADER_VERSION 309
 
 #ifdef __cplusplus
 extern "C" {
