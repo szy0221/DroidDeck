@@ -11,6 +11,7 @@
  * repeated enumeration returns the same pointers, as the spec requires.
  */
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
