@@ -61,5 +61,14 @@ echo "== loopback test =="
     "$VK/tests/vkfw_loopback.c" "$SRC_ICD/vk_forward.c" "$SRC_SERVER/vkfw_server_core.c" "${COMMON_SRCS[@]}" \
     -ldl -lpthread
 
+# Goes through the system loader, so it sees the ICD the way an app does. Needs
+# libvulkan at run time only.
+echo "== loader probe =="
+"$CC_BIN" -O2 $CFLAGS $WARN \
+    -I"$SRC_COMMON" \
+    -o "$OUT/vkfw_loader_probe" \
+    "$VK/tests/vkfw_loader_probe.c" \
+    -ldl
+
 echo "artifacts in $OUT:"
 ls -1 "$OUT"
