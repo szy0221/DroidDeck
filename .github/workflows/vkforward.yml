@@ -59,7 +59,8 @@ jobs:
             VKFW_SOCKET=/tmp/vkfw-probe.sock \
             VKFW_TRACE=1 \
             VK_LOADER_DEBUG=all \
-            gdb -return-child-result -batch -ex run -ex "bt 12" --args ./vkfw_loader_probe
+            gdb -return-child-result -batch -ex run -ex "bt 12" -ex "info proc mappings" \
+            --args ./vkfw_loader_probe
 
       - name: End-to-end vulkaninfo through the real loader
         env:
