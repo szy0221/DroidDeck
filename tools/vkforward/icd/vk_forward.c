@@ -812,11 +812,31 @@ static void vkfw_vkGetPhysicalDeviceSparseImageFormatProperties2(
     VkSparseImageFormatProperties2 *pProps)
 {
     if (!info || !pCount) return;
-    /* Only the top-level fields are forwarded; the info struct can chain nodes
-     * with pointers (e.g. sharing-mode QueueFamilyIndices) that cannot cross. */
+    /* Only core fields of the info struct are forwarded (see the 1.0 variant),
+     * and the properties are collected into a flat array first: the caller's
+     * elements are VkSparseImageFormatProperties2, which are wider than the
+     * payload items and must not be written through contiguously. */
+    uint32_t count = 0;
     vkfw_vkGetPhysicalDeviceSparseImageFormatProperties(pd, info->format, info->type, info->samples,
-                                                        info->usage, info->tiling, pCount,
-                                                        pProps ? &pProps[0].properties : NULL);
+                                                        info->usage, info->tiling, &count, NULL);
+    if (!pProps) {
+        *pCount = count;
+        return;
+    }
+    VkSparseImageFormatProperties *flat = NULL;
+    if (count > 0) {
+        flat = calloc(count, sizeof(*flat));
+        if (!flat) {
+            *pCount = 0;
+            return;
+        }
+    }
+    uint32_t got = count;
+    vkfw_vkGetPhysicalDeviceSparseImageFormatProperties(pd, info->format, info->type, info->samples,
+                                                        info->usage, info->tiling, &got, flat);
+    for (uint32_t i = 0; i < got; i++) pProps[i].properties = flat[i];
+    free(flat);
+    *pCount = got;
 }
 
 static void vkfw_vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice pd,
