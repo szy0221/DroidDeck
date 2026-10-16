@@ -38,7 +38,7 @@ jobs:
         run: ls -l /usr/share/vulkan/icd.d/
 
       - name: Build
-        run: tools/vkforward/scripts/build-linux.sh
+        run: bash tools/vkforward/scripts/build-linux.sh
 
       - name: Loopback check, forwarded properties come back intact
         env:
@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euxo pipefail
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
-          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018" cmake "3.22.1"
+          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018"
 
       - name: Build the forwarding library for aarch64 Android
         run: |
