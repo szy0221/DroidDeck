@@ -1,0 +1,7 @@
+# Build helpers must stay LF, otherwise bash chokes on CRLF line endings when
+# the tree is checked out with autocrlf enabled.
+*.sh text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
