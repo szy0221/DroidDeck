@@ -6,6 +6,11 @@ name: Build lavapipe (software Vulkan) for the Linux runtime
 # rasteriser (lavapipe) for aarch64 with a statically linked LLVM, so the
 # result is a single self-contained libvulkan_lvp.so that can be dropped in
 # through the app's "Linux driver" import (which copies only the .so).
+#
+# It also carries the small Mesa patch in .github/scripts/lavapipe-patch.sh:
+# a device without a DRM render node cannot hand out dma-bufs, and lavapipe
+# reports every failure on that path as VK_ERROR_OUT_OF_DEVICE_MEMORY, which
+# gamescope turns into an assertion in vulkan_create_flat_texture().
 
 on:
   workflow_dispatch:
@@ -23,6 +28,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     steps:
+      - uses: actions/checkout@v4
+
       - name: Install build dependencies
         run: |
           set -euxo pipefail
@@ -37,6 +44,7 @@ jobs:
             libxcb-sync-dev libxcb-randr0-dev libxcb-xfixes0-dev \
             libdrm-dev zlib1g-dev libzstd-dev libexpat1-dev libudev-dev \
             ca-certificates curl xz-utils zip
+          llvm-config --version
 
       # Ubuntu 24.04 ships meson 1.3.2, Mesa 26.2 wants >= 1.4. Take meson and
       # ninja from pip, but let the venv see the apt-installed python modules
@@ -56,6 +64,9 @@ jobs:
           tar xf mesa.tar.gz
           mv mesa-mesa-26.2.0 mesa
 
+      - name: Patch Mesa for a device without a DRM render node
+        run: bash .github/scripts/lavapipe-patch.sh mesa
+
       - name: Configure (lavapipe only, static LLVM)
         run: |
           set -euxo pipefail
@@ -67,7 +78,7 @@ jobs:
             -Dplatforms=x11,wayland \
             -Dllvm=enabled -Dshared-llvm=disabled \
             -Dlibunwind=disabled -Dvalgrind=disabled \
-            -Dvideo-codecs= -Dtools= -Dtests=false -Dperfetto=false
+            -Dvideo-codecs= -Dtools=
 
       - name: Build
         run: |
@@ -83,14 +94,13 @@ jobs:
           [ -n "$SO" ] && [ -s "$SO" ]
           mkdir -p pkg
           cp "$SO" pkg/libvulkan_lvp.so
-          cat > pkg/meta.json <<'EOF'
-          {"schemaVersion":1,"kind":"linux-vulkan-icd","name":"Mesa lavapipe (software Vulkan)","driverVersion":"26.2","libc":"glibc","minGlibc":"2.31"}
-          EOF
+          strip --strip-unneeded pkg/libvulkan_lvp.so || true
+          printf '%s\n' '{"schemaVersion":1,"kind":"linux-vulkan-icd","name":"Mesa lavapipe 26.2.0 (software Vulkan)","driverVersion":"26.2.0","libc":"glibc","minGlibc":"2.31"}' > pkg/meta.json
           (cd pkg && zip -9 -r ../lavapipe-linux-aarch64.zip .)
           unzip -l lavapipe-linux-aarch64.zip
           ls -lh lavapipe-linux-aarch64.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lavapipe-linux-aarch64
+          name: lavapipe-droiddeck
           path: lavapipe-linux-aarch64.zip
