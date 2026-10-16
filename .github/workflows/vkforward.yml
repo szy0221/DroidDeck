@@ -55,9 +55,12 @@ jobs:
           SERVER_PID=$!
           trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
           for _ in $(seq 1 20); do [ -S /tmp/vkfw-probe.sock ] && break; sleep 0.2; done
+          # No VKFW_TRACE here. The trace names every entry point this ICD
+          # cannot serve, and the loader asks for several hundred up front,
+          # which is the right thing to hand someone debugging on a device and
+          # the wrong thing to put in a passing log.
           VK_ICD_FILENAMES="$PWD/vkforward_icd.aarch64.json" \
             VKFW_SOCKET=/tmp/vkfw-probe.sock \
-            VKFW_TRACE=1 \
             bash ../scripts/run-with-backtrace.sh \
             "$RUNNER_TEMP/loader-probe.txt" ./vkfw_loader_probe
 
@@ -80,7 +83,6 @@ jobs:
           for _ in $(seq 1 20); do [ -S /tmp/vkfw-server.sock ] && break; sleep 0.2; done
           VK_ICD_FILENAMES="$PWD/vkforward_icd.aarch64.json" \
             VKFW_SOCKET=/tmp/vkfw-server.sock \
-            VKFW_TRACE=1 \
             bash ../scripts/run-with-backtrace.sh \
             "$RUNNER_TEMP/vulkaninfo-summary.txt" vulkaninfo --summary
           grep -qi 'llvmpipe\|lavapipe' "$RUNNER_TEMP/vulkaninfo-summary.txt"
