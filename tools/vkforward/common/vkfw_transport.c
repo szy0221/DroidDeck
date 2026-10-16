@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -94,6 +95,41 @@ bool vkfw_read_frame(int fd, struct vkfw_header *hdr, vkfw_buf *payload)
     void *at = vkfw_buf_extend(payload, hdr->payload_len);
     if (!at) return false;
     return vkfw_read_exact(fd, at, hdr->payload_len) == (ssize_t)hdr->payload_len;
+}
+
+/* ---- command names and tracing ------------------------------------------ */
+
+#define VKFW_CMD_CASE(name, assign)                                            \
+    case VKFW_CMD_##name: return #name;
+
+const char *vkfw_cmd_name(uint16_t cmd)
+{
+    switch (cmd) {
+        VKFW_COMMANDS(VKFW_CMD_CASE)
+    }
+    return "UNKNOWN";
+}
+
+#undef VKFW_CMD_CASE
+
+/*
+ * A forwarding ICD crashes inside the caller, not inside itself: by the time
+ * the fault lands, the interesting thing is the last query whose answer the
+ * caller was chewing on. Printing every exchange with VKFW_TRACE=1 makes that
+ * the last line of a session log, which is the only debugger a tablet has.
+ */
+static bool vkfw_trace_on(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("VKFW_TRACE") != NULL;
+    return enabled != 0;
+}
+
+static void vkfw_trace(uint16_t cmd, size_t len, int rc, const vkfw_buf *reply)
+{
+    if (!vkfw_trace_on()) return;
+    int32_t result = rc == 0 ? vkfw_reply_result(reply) : rc;
+    fprintf(stderr, "[vkforward] %s in=%zu -> %d\n", vkfw_cmd_name(cmd), len, result);
 }
 
 /* ---- client ------------------------------------------------------------- */
@@ -198,6 +234,7 @@ int vkfw_transact(uint16_t cmd, const void *payload, size_t payload_len, vkfw_bu
     rc = 0;
 
 out:
+    vkfw_trace(cmd, payload_len, rc, rc == 0 ? out : &reply);
     vkfw_buf_free(&reply);
     pthread_mutex_unlock(&g_client_lock);
     return rc;

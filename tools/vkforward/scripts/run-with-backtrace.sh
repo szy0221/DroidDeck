@@ -24,7 +24,11 @@ if [ "$CODE" -eq 0 ]; then
 fi
 
 echo "=== command exited with $CODE, rerunning under gdb ==="
-gdb -return-child-result -batch -ex run -ex "bt 25" -ex "x/6i \$pc" --args "$@"
+# The mapping list comes first: a fault at an address that belongs to no
+# library is the tell for a jump through a bad pointer, and it names the
+# region even when nothing there carries symbols.
+gdb -return-child-result -batch -ex run -ex "info proc mappings" -ex "bt 25" -ex "x/6i \$pc" \
+    --args "$@"
 
 # Report the original failure, not whatever gdb decided to return.
 exit "$CODE"

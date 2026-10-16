@@ -37,81 +37,86 @@ struct vkfw_header {
     uint64_t seq;
 };
 
-enum vkfw_cmd {
-    VKFW_CMD_PING = 0,
+/*
+ * The commands are written down once and consumed twice: once as the enum the
+ * wire uses, once as the names VKFW_TRACE prints. A new command therefore
+ * cannot end up on the wire without a name to report it by, which matters
+ * because a trace is the only thing this layer can leave behind on a device
+ * nobody can attach a debugger to.
+ *
+ * The second argument is the enumerator's assignment, or nothing at all for
+ * the members that follow on from the one above them.
+ */
+#define VKFW_COMMANDS(X)                                                       \
+    X(PING, = 0)                                                               \
+    X(ENUMERATE_INSTANCE_VERSION, = 10)                                        \
+    X(ENUMERATE_INSTANCE_LAYERS, )                                             \
+    X(ENUMERATE_INSTANCE_EXTENSIONS, )                                         \
+    X(CREATE_INSTANCE, )                                                       \
+    X(DESTROY_INSTANCE, )                                                      \
+    X(ENUMERATE_PHYSICAL_DEVICES, = 30)                                        \
+    X(ENUMERATE_PHYSICAL_DEVICE_GROUPS, )                                      \
+    X(GET_PHYSICAL_DEVICE_PROPERTIES, )                                        \
+    X(GET_PHYSICAL_DEVICE_PROPERTIES2, )                                       \
+    X(GET_PHYSICAL_DEVICE_FEATURES, )                                          \
+    X(GET_PHYSICAL_DEVICE_FEATURES2, )                                         \
+    X(GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES, )                           \
+    X(GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES2, )                          \
+    X(GET_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_PROPERTIES, )                    \
+    X(GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES, )                                 \
+    X(GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES2, )                                \
+    X(GET_PHYSICAL_DEVICE_FORMAT_PROPERTIES, )                                 \
+    X(GET_PHYSICAL_DEVICE_IMAGE_FORMAT_PROPERTIES, )                           \
+    X(ENUMERATE_DEVICE_EXTENSIONS, )                                           \
+    X(ENUMERATE_DEVICE_LAYERS, )                                               \
+    X(GET_PHYSICAL_DEVICE_EXTERNAL_BUFFER_PROPERTIES, )                        \
+    X(GET_PHYSICAL_DEVICE_EXTERNAL_FENCE_PROPERTIES, )                         \
+    X(GET_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_PROPERTIES, )                     \
+    X(GET_PHYSICAL_DEVICE_TOOL_PROPERTIES, )                                   \
+    X(CREATE_DEVICE, = 60)                                                     \
+    X(DESTROY_DEVICE, )                                                        \
+    X(GET_DEVICE_QUEUE, )                                                      \
+    X(DEVICE_WAIT_IDLE, )                                                      \
+    X(ALLOCATE_MEMORY, = 80)                                                   \
+    X(FREE_MEMORY, )                                                           \
+    X(MAP_MEMORY, )                                                            \
+    X(UNMAP_MEMORY, )                                                          \
+    X(CREATE_BUFFER, )                                                         \
+    X(DESTROY_BUFFER, )                                                        \
+    X(GET_BUFFER_MEMORY_REQUIREMENTS, )                                        \
+    X(BIND_BUFFER_MEMORY, )                                                    \
+    X(CREATE_IMAGE, )                                                          \
+    X(DESTROY_IMAGE, )                                                         \
+    X(GET_IMAGE_MEMORY_REQUIREMENTS, )                                         \
+    X(BIND_IMAGE_MEMORY, )                                                     \
+    X(CREATE_FENCE, = 100)                                                     \
+    X(DESTROY_FENCE, )                                                         \
+    X(RESET_FENCES, )                                                          \
+    X(GET_FENCE_STATUS, )                                                      \
+    X(WAIT_FOR_FENCES, )                                                       \
+    X(CREATE_SEMAPHORE, )                                                      \
+    X(DESTROY_SEMAPHORE, )                                                     \
+    X(GET_SEMAPHORE_COUNTER_VALUE, )                                           \
+    X(SIGNAL_SEMAPHORE, )                                                      \
+    X(WAIT_SEMAPHORES, )                                                       \
+    X(CREATE_COMMAND_POOL, = 120)                                              \
+    X(DESTROY_COMMAND_POOL, )                                                  \
+    X(RESET_COMMAND_POOL, )                                                    \
+    X(ALLOCATE_COMMAND_BUFFERS, )                                              \
+    X(FREE_COMMAND_BUFFERS, )                                                  \
+    X(BEGIN_COMMAND_BUFFER, )                                                  \
+    X(END_COMMAND_BUFFER, )                                                    \
+    X(RESET_COMMAND_BUFFER, )                                                  \
+    X(QUEUE_SUBMIT, )                                                          \
+    X(QUEUE_WAIT_IDLE, )
 
-    /* ---- instance level ---------------------------------------------- */
-    VKFW_CMD_ENUMERATE_INSTANCE_VERSION = 10,
-    VKFW_CMD_ENUMERATE_INSTANCE_LAYERS,
-    VKFW_CMD_ENUMERATE_INSTANCE_EXTENSIONS,
-    VKFW_CMD_CREATE_INSTANCE,
-    VKFW_CMD_DESTROY_INSTANCE,
+#define VKFW_CMD_ENUM(name, assign) VKFW_CMD_##name assign,
 
-    /* ---- physical device (M1 core) ----------------------------------- */
-    VKFW_CMD_ENUMERATE_PHYSICAL_DEVICES = 30,
-    VKFW_CMD_ENUMERATE_PHYSICAL_DEVICE_GROUPS,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_PROPERTIES,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_PROPERTIES2,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_FEATURES,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_FEATURES2,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES2,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_PROPERTIES,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES2,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_FORMAT_PROPERTIES,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_IMAGE_FORMAT_PROPERTIES,
-    VKFW_CMD_ENUMERATE_DEVICE_EXTENSIONS,
-    VKFW_CMD_ENUMERATE_DEVICE_LAYERS,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_EXTERNAL_BUFFER_PROPERTIES,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_EXTERNAL_FENCE_PROPERTIES,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_PROPERTIES,
-    VKFW_CMD_GET_PHYSICAL_DEVICE_TOOL_PROPERTIES,
+enum vkfw_cmd { VKFW_COMMANDS(VKFW_CMD_ENUM) };
 
-    /* ---- device level ------------------------------------------------- */
-    VKFW_CMD_CREATE_DEVICE = 60,
-    VKFW_CMD_DESTROY_DEVICE,
-    VKFW_CMD_GET_DEVICE_QUEUE,
-    VKFW_CMD_DEVICE_WAIT_IDLE,
+#undef VKFW_CMD_ENUM
 
-    /* ---- memory / buffers / images (M2) -------------------------------- */
-    VKFW_CMD_ALLOCATE_MEMORY = 80,
-    VKFW_CMD_FREE_MEMORY,
-    VKFW_CMD_MAP_MEMORY,
-    VKFW_CMD_UNMAP_MEMORY,
-    VKFW_CMD_CREATE_BUFFER,
-    VKFW_CMD_DESTROY_BUFFER,
-    VKFW_CMD_GET_BUFFER_MEMORY_REQUIREMENTS,
-    VKFW_CMD_BIND_BUFFER_MEMORY,
-    VKFW_CMD_CREATE_IMAGE,
-    VKFW_CMD_DESTROY_IMAGE,
-    VKFW_CMD_GET_IMAGE_MEMORY_REQUIREMENTS,
-    VKFW_CMD_BIND_IMAGE_MEMORY,
-
-    /* ---- synchronisation (M2) ----------------------------------------- */
-    VKFW_CMD_CREATE_FENCE = 100,
-    VKFW_CMD_DESTROY_FENCE,
-    VKFW_CMD_RESET_FENCES,
-    VKFW_CMD_GET_FENCE_STATUS,
-    VKFW_CMD_WAIT_FOR_FENCES,
-    VKFW_CMD_CREATE_SEMAPHORE,
-    VKFW_CMD_DESTROY_SEMAPHORE,
-    VKFW_CMD_GET_SEMAPHORE_COUNTER_VALUE,
-    VKFW_CMD_SIGNAL_SEMAPHORE,
-    VKFW_CMD_WAIT_SEMAPHORES,
-
-    /* ---- command buffers and submission (M2) --------------------------- */
-    VKFW_CMD_CREATE_COMMAND_POOL = 120,
-    VKFW_CMD_DESTROY_COMMAND_POOL,
-    VKFW_CMD_RESET_COMMAND_POOL,
-    VKFW_CMD_ALLOCATE_COMMAND_BUFFERS,
-    VKFW_CMD_FREE_COMMAND_BUFFERS,
-    VKFW_CMD_BEGIN_COMMAND_BUFFER,
-    VKFW_CMD_END_COMMAND_BUFFER,
-    VKFW_CMD_RESET_COMMAND_BUFFER,
-    VKFW_CMD_QUEUE_SUBMIT,
-    VKFW_CMD_QUEUE_WAIT_IDLE,
-};
+const char *vkfw_cmd_name(uint16_t cmd);
 
 /* Transport-level failures the ICD turns into a Vulkan error instead of
  * hanging the caller. Deliberately outside the VkResult range. */

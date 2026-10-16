@@ -61,6 +61,13 @@ jobs:
             bash ../scripts/run-with-backtrace.sh \
             "$RUNNER_TEMP/loader-probe.txt" ./vkfw_loader_probe
 
+      - name: Sanity check, vulkaninfo talks to the driver without us
+        run: |
+          set -euxo pipefail
+          VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json \
+            vulkaninfo --summary | tee "$RUNNER_TEMP/vulkaninfo-native.txt"
+          grep -qi 'llvmpipe\|lavapipe' "$RUNNER_TEMP/vulkaninfo-native.txt"
+
       - name: End-to-end vulkaninfo through the real loader
         env:
           VKFW_DRIVER: /usr/lib/aarch64-linux-gnu/libvulkan_lvp.so
@@ -73,6 +80,7 @@ jobs:
           for _ in $(seq 1 20); do [ -S /tmp/vkfw-server.sock ] && break; sleep 0.2; done
           VK_ICD_FILENAMES="$PWD/vkforward_icd.aarch64.json" \
             VKFW_SOCKET=/tmp/vkfw-server.sock \
+            VKFW_TRACE=1 \
             bash ../scripts/run-with-backtrace.sh \
             "$RUNNER_TEMP/vulkaninfo-summary.txt" vulkaninfo --summary
           grep -qi 'llvmpipe\|lavapipe' "$RUNNER_TEMP/vulkaninfo-summary.txt"
