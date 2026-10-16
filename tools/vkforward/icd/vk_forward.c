@@ -121,11 +121,17 @@ static struct vkfw_device *vkfw_as_device(VkDevice d)
 
 /* ---- transport plumbing ------------------------------------------------- */
 
-static VkResult vkfw_map_error(int32_t result, VkResult on_create)
+/*
+ * Only the transport's own codes are ours to put a word to. A VkResult the
+ * driver produced has to reach the caller exactly as it was produced:
+ * VK_ERROR_FORMAT_NOT_SUPPORTED is a routine answer to "can I make an image
+ * like this", and a caller told VK_ERROR_INITIALIZATION_FAILED in its place
+ * reads that as the driver being broken, which is why it gives up.
+ */
+static VkResult vkfw_map_error(int32_t result, VkResult on_transport)
 {
-    if (result >= 0) return (VkResult)result;
-    if (result == VKFW_ERR_PROTOCOL) return VK_ERROR_INITIALIZATION_FAILED;
-    return on_create;
+    if (result == VKFW_ERR_TRANSPORT || result == VKFW_ERR_PROTOCOL) return on_transport;
+    return (VkResult)result;
 }
 
 /* Runs one command; *reply is owned by the caller and must be freed. */
@@ -1252,7 +1258,7 @@ static VkResult vkfw_vkCreateImage(VkDevice device, const VkImageCreateInfo *pCr
     vkfw_buf_free(&req);
     if (rc != VK_SUCCESS) {
         vkfw_buf_free(&reply);
-        return VK_ERROR_OUT_OF_HOST_MEMORY == rc ? rc : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        return vkfw_map_error(rc, VK_ERROR_OUT_OF_DEVICE_MEMORY);
     }
     uint64_t id = 0;
     if (!vkfw_cur_u64(&body, &id)) {
