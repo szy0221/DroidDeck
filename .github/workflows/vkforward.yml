@@ -57,6 +57,8 @@ jobs:
           for _ in $(seq 1 20); do [ -S /tmp/vkfw-server.sock ] && break; sleep 0.2; done
           VK_ICD_FILENAMES="$PWD/vkforward_icd.aarch64.json" \
             VKFW_SOCKET=/tmp/vkfw-server.sock \
+            VKFW_TRACE=1 \
+            VK_LOADER_DEBUG=error,warn \
             vulkaninfo --summary | tee "$RUNNER_TEMP/vulkaninfo-summary.txt"
           grep -qi 'llvmpipe\|lavapipe' "$RUNNER_TEMP/vulkaninfo-summary.txt"
 
