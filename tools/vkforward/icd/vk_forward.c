@@ -1222,11 +1222,14 @@ static void vkfw_vkGetDeviceQueue(VkDevice device, uint32_t familyIndex, uint32_
 /* Set VKFW_TRACE=1 to log the entry points we cannot serve. Those are exactly
  * the calls a real Vulkan app will crash on, so this is the first thing to look
  * at when something misbehaves on device. */
-static void vkfw_trace_missing(const char *pName)
+static void vkfw_trace_missing(const char *table, const char *pName)
 {
     static int enabled = -1;
     if (enabled < 0) enabled = getenv("VKFW_TRACE") != NULL;
-    if (enabled) fprintf(stderr, "vkforward: unsupported entry point %s\n", pName);
+    /* Which table matters: a miss on the device table is what a tool reaches
+     * for only after it has a device, and a NULL it does not check for is a
+     * call through address zero. */
+    if (enabled) fprintf(stderr, "vkforward: unsupported %s entry point %s\n", table, pName);
 }
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetDeviceProcAddr(VkDevice device, const char *pName);
@@ -1294,7 +1297,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetInstanceProcAddr(VkIns
     ENTRY(vkDeviceWaitIdle);
 #undef ENTRY
 #undef ALIAS
-    vkfw_trace_missing(pName);
+    vkfw_trace_missing("instance", pName);
     return NULL;
 }
 
@@ -1312,7 +1315,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetDeviceProcAddr(VkDevic
     ENTRY(vkDeviceWaitIdle);
 #undef ENTRY
 #undef ALIAS
-    vkfw_trace_missing(pName);
+    vkfw_trace_missing("device", pName);
     return NULL;
 }
 

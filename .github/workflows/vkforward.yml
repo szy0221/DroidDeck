@@ -93,6 +93,30 @@ jobs:
             tools/vkforward/build-linux/vkforward_icd.aarch64.json
             tools/vkforward/build-linux/vkfw_server
 
+  runtime-icd:
+    # The ICD is what the runtime loads, and the runtime is a bullseye rootfs,
+    # so it is built in the image it has to load in rather than on this runner.
+    name: Build the runtime ICD (aarch64, glibc 2.31)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in Debian bullseye
+        run: |
+          set -euxo pipefail
+          docker run --rm -v "$PWD:/work" -w /work \
+            public.ecr.aws/docker/library/debian:bullseye \
+            bash tools/vkforward/scripts/build-in-bullseye.sh
+          sudo chown -R "$(id -u):$(id -g)" tools/vkforward/build-runtime
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vkforward-linux-aarch64
+          path: |
+            tools/vkforward/build-runtime/vkforward-linux-aarch64.zip
+            tools/vkforward/build-runtime/vkforward_icd.aarch64.json
+
   android-server:
     name: Build the app-side server with the NDK
     runs-on: ubuntu-latest
