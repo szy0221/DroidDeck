@@ -58,9 +58,8 @@ jobs:
           VK_ICD_FILENAMES="$PWD/vkforward_icd.aarch64.json" \
             VKFW_SOCKET=/tmp/vkfw-probe.sock \
             VKFW_TRACE=1 \
-            VK_LOADER_DEBUG=all \
-            gdb -return-child-result -batch -ex run -ex "bt 12" -ex "info proc mappings" \
-            --args ./vkfw_loader_probe
+            bash ../scripts/run-with-backtrace.sh \
+            "$RUNNER_TEMP/loader-probe.txt" ./vkfw_loader_probe
 
       - name: End-to-end vulkaninfo through the real loader
         env:
@@ -74,10 +73,8 @@ jobs:
           for _ in $(seq 1 20); do [ -S /tmp/vkfw-server.sock ] && break; sleep 0.2; done
           VK_ICD_FILENAMES="$PWD/vkforward_icd.aarch64.json" \
             VKFW_SOCKET=/tmp/vkfw-server.sock \
-            VKFW_TRACE=1 \
-            VK_LOADER_DEBUG=error,warn \
-            gdb -return-child-result -batch -ex run -ex "bt 25" -ex "x/6i \$pc" --args \
-            vulkaninfo --summary | tee "$RUNNER_TEMP/vulkaninfo-summary.txt"
+            bash ../scripts/run-with-backtrace.sh \
+            "$RUNNER_TEMP/vulkaninfo-summary.txt" vulkaninfo --summary
           grep -qi 'llvmpipe\|lavapipe' "$RUNNER_TEMP/vulkaninfo-summary.txt"
 
       - uses: actions/upload-artifact@v4

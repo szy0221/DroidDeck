@@ -37,3 +37,20 @@ add_library(deviceinfo SHARED deviceinfo/vkinfo.c)
 target_link_libraries(deviceinfo dl)
 
 add_library(termux SHARED termux/termux.c)
+
+# Route B, Mali Vulkan forwarding. The ICD half of the pair is built for the
+# proot runtime by tools/vkforward/scripts/build-linux.sh; this is the in-app
+# half that owns the real driver and serves the runtime over a socket.
+set(VKFW_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../tools/vkforward")
+add_library(vkforward_server SHARED
+        ${VKFW_DIR}/server/vkfw_server_core.c
+        ${VKFW_DIR}/server/vk_forward_server.c
+        ${VKFW_DIR}/common/vkfw_codec.c
+        ${VKFW_DIR}/common/vkfw_transport.c
+        ${VKFW_DIR}/common/vkfw_pnext_sizes.c
+)
+target_include_directories(vkforward_server PRIVATE
+        ${VKFW_DIR}/common
+        ${VKFW_DIR}/server
+)
+target_link_libraries(vkforward_server dl log)

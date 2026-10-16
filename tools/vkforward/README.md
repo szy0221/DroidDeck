@@ -32,6 +32,11 @@ icd/      libvulkan_vkforward.so for the glibc runtime (M1: queries and device
 server/   the app-side native half plus its JNI bridge.
 scripts/  build helpers and the pNext table generator.
 tests/    vkfw_loopback.c — server and ICD in one process, over a real socket.
+
+The Kotlin half lives where it has to, in the app tree:
+app/src/main/java/com/droiddeck/launcher/gpu/VkForwardServer.kt. The app build
+compiles these C files through its own CMakeLists, so the server ships inside
+the APK and there is no second copy of the transport to keep in step.
 ```
 
 ## Same-ABI assumption
@@ -94,6 +99,22 @@ Pass an absolute path as the endpoint: Android shells have no `$TMPDIR`. The
 server side then `dlopen`s the vendor HAL, which is exactly what the app-side
 server will do.
 
+### In the app
+
+`App.onCreate` calls `VkForwardServer.startOnMali()`, which gates on the same
+Mali detection the A-line work landed, so the listener only exists on hardware
+route B targets. Once up, the runtime's ICD reaches it on the abstract socket
+`vkforward` without anything being mounted.
+
+### In the runtime
+
+Not wired up yet. This tree builds `libvulkan_vkforward.so` and its manifest;
+the next step drops those two files into the runtime image the way the
+lavapipe work does — as an overlay under `tools/linuxfs/overlay`, so the ICD
+lands at `/usr/local/lib` and its JSON in `/usr/share/vulkan/icd.d`. For a
+hand-rolled check in the meantime, push both into a running session and point
+`VK_ICD_FILENAMES` at the manifest.
+
 ## M1 exit criterion
 
 `vulkaninfo` inside the runtime lists the Mali device with properties, limits
@@ -108,6 +129,6 @@ on every change.
 - `vkCreateInstance` forwards app/engine info and enabled names only; the
   loader's own pNext nodes do not cross the socket.
 - Window system integration is not forwarded — gamescope owns presentation.
-- `vkGetPhysicalDeviceQueueFamilyProperties2` / `...MemoryProperties2` are not
-  exported yet; their chains would need per-family/per-heap round trips.
 - No Vulkan layers in this ICD.
+- The loader resolves promoted `...2KHR` aliases only while their extension is
+  enabled; without it the ICD sees the core spellings, which is what it serves.

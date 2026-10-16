@@ -1,6 +1,7 @@
 package com.droiddeck.launcher
 
 import android.app.Application
+import com.droiddeck.launcher.gpu.VkForwardServer
 import com.droiddeck.launcher.runtime.BwrapSpawner
 import com.droiddeck.launcher.session.CrashHandler
 import com.droiddeck.launcher.session.GpuClockPin
@@ -22,6 +23,9 @@ class App : Application() {
         com.droiddeck.launcher.update.AppUpdates.init(this)
         GpuClockPin.clearLeftover(this)
         BwrapSpawner.start(this)
+        // Route B: serve the real Mali driver to the proot runtime. Up before
+        // any session, because the runtime's ICD connects as it starts.
+        VkForwardServer.startOnMali()
         com.droiddeck.launcher.frontend.GameFileSync.start(this)
         com.droiddeck.launcher.stores.StoresState.init(this)
         com.droiddeck.launcher.stores.StoresState.register(com.droiddeck.launcher.stores.gog.GogBackend)
