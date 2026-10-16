@@ -1,0 +1,77 @@
+name: Build lavapipe (software Vulkan) for the Linux runtime
+
+# Steam's gamescope compositor is Vulkan-only. On a non-Adreno GPU the runtime
+# ships just freedreno (which sees no physical device there), so gamescope dies
+# with "failed to find physical device". This job builds Mesa's software Vulkan
+# rasteriser (lavapipe) for aarch64 with a statically linked LLVM, so the
+# result is a single self-contained libvulkan_lvp.so that can be dropped in
+# through the app's "Linux driver" import (which copies only the .so).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lavapipe-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  lavapipe:
+    name: Build Mesa lavapipe (aarch64, static LLVM)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build pkg-config clang llvm-dev libclang-dev \
+            python3-mako python3-yaml python3-packaging bison flex \
+            libwayland-dev wayland-protocols libx11-dev libxext-dev \
+            libxshmfence-dev libdrm-dev libxcb1-dev libxcb-dri3-dev \
+            zlib1g-dev libzstd-dev libexpat1-dev libudev-dev \
+            ca-certificates curl xz-utils zip
+
+      - name: Fetch Mesa 26.2
+        run: |
+          set -euxo pipefail
+          curl -L -o mesa.tar.gz \
+            https://gitlab.freedesktop.org/mesa/mesa/-/archive/mesa-26.2.0/mesa-mesa-26.2.0.tar.gz
+          tar xf mesa.tar.gz
+          mv mesa-mesa-26.2.0 mesa
+
+      - name: Configure (lavapipe only, static LLVM)
+        run: |
+          set -euxo pipefail
+          meson setup mesa/build mesa --buildtype=release \
+            -Dvulkan-drivers=swrast \
+            -Dgallium-drivers= \
+            -Dopengl=false -Dglx=disabled -Degl=disabled \
+            -Dplatforms=x11,wayland \
+            -Dllvm=enabled -Dshared-llvm=disabled \
+            -Dlibunwind=disabled -Dvalgrind=disabled \
+            -Dvideo-codecs= -Dtools= -Dtests=false -Dperfetto=false
+
+      - name: Build
+        run: ninja -C mesa/build -j"$(nproc)"
+
+      - name: Package (only what the import reads: the .so + meta)
+        run: |
+          set -euxo pipefail
+          SO=$(find mesa/build/src/vulkan -name 'libvulkan_lvp.so' | head -1)
+          [ -n "$SO" ]
+          mkdir -p pkg
+          cp "$SO" pkg/
+          cat > pkg/meta.json <<'EOF'
+          {"schemaVersion":1,"kind":"linux-vulkan-icd","name":"Mesa lavapipe (software Vulkan)","driverVersion":"26.2","libc":"glibc","minGlibc":"2.31"}
+          EOF
+          (cd pkg && zip -9 -r ../lavapipe-linux-aarch64.zip .)
+          ls -lh lavapipe-linux-aarch64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lavapipe-linux-aarch64
+          path: lavapipe-linux-aarch64.zip
