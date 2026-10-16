@@ -44,6 +44,142 @@ static void *accept_thread(void *p)
     }
 }
 
+static void dump_device_extensions(PFN_vkEnumerateDeviceExtensionProperties fn, VkPhysicalDevice pd);
+
+/* Phase 2 does what a real Vulkan tool does: enables every reported extension
+ * and walks the long pNext chains (the VkPhysicalDeviceVulkan1x* structs) that
+ * vulkaninfo relies on. Anything wrong in the chain marshalling shows up here,
+ * in a binary that carries our symbols, instead of inside a stripped tool. */
+static int tool_style_sweep(PFN_vkGetInstanceProcAddr gipa)
+{
+    PFN_vkEnumerateInstanceExtensionProperties enum_inst_ext =
+        (PFN_vkEnumerateInstanceExtensionProperties)gipa(NULL, "vkEnumerateInstanceExtensionProperties");
+    PFN_vkCreateInstance create = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
+    PFN_vkDestroyInstance destroy_inst = (PFN_vkDestroyInstance)gipa(NULL, "vkDestroyInstance");
+    if (!enum_inst_ext || !create) return 1;
+
+    uint32_t count = 0;
+    enum_inst_ext(NULL, &count, NULL);
+    VkExtensionProperties *exts = calloc(count ? count : 1, sizeof(*exts));
+    enum_inst_ext(NULL, &count, exts);
+    const char **names = calloc(count ? count : 1, sizeof(char *));
+    for (uint32_t i = 0; i < count; i++) names[i] = exts[i].extensionName;
+    printf("\n[tool sweep] instance extensions reported: %u\n", count);
+
+    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    app.pApplicationName = "vkforward-tool-sweep";
+    app.apiVersion = VK_MAKE_VERSION(1, 3, 0);
+    VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    ici.pApplicationInfo = &app;
+    ici.enabledExtensionCount = count;
+    ici.ppEnabledExtensionNames = names;
+
+    VkInstance instance = VK_NULL_HANDLE;
+    VkResult r = create(&ici, NULL, &instance);
+    printf("[tool sweep] create instance with all extensions: %d\n", r);
+    printf("[tool sweep] sweeping instance extensions: %d\n", r);
+    if (r != VK_SUCCESS) {
+        free(exts);
+        free(names);
+        return 1;
+    }
+
+    gipa = (PFN_vkGetInstanceProcAddr)gipa(instance, "vkGetInstanceProcAddr");
+    PFN_vkEnumeratePhysicalDevices enum_pd = (PFN_vkEnumeratePhysicalDevices)gipa(instance, "vkEnumeratePhysicalDevices");
+    PFN_vkGetPhysicalDeviceProperties2 props2 = (PFN_vkGetPhysicalDeviceProperties2)gipa(instance, "vkGetPhysicalDeviceProperties2");
+    PFN_vkGetPhysicalDeviceFeatures2 features2 = (PFN_vkGetPhysicalDeviceFeatures2)gipa(instance, "vkGetPhysicalDeviceFeatures2");
+    PFN_vkGetPhysicalDeviceMemoryProperties2 mem2 =
+        (PFN_vkGetPhysicalDeviceMemoryProperties2)gipa(instance, "vkGetPhysicalDeviceMemoryProperties2");
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties2 qf2 =
+        (PFN_vkGetPhysicalDeviceQueueFamilyProperties2)gipa(instance, "vkGetPhysicalDeviceQueueFamilyProperties2");
+    PFN_vkGetPhysicalDeviceImageFormatProperties2 image2 =
+        (PFN_vkGetPhysicalDeviceImageFormatProperties2)gipa(instance, "vkGetPhysicalDeviceImageFormatProperties2");
+    PFN_vkGetPhysicalDeviceSparseImageFormatProperties2 sparse2 =
+        (PFN_vkGetPhysicalDeviceSparseImageFormatProperties2)gipa(instance, "vkGetPhysicalDeviceSparseImageFormatProperties2");
+    PFN_vkEnumerateDeviceExtensionProperties dev_ext =
+        (PFN_vkEnumerateDeviceExtensionProperties)gipa(instance, "vkEnumerateDeviceExtensionProperties");
+
+    uint32_t pd_count = 0;
+    enum_pd(instance, &pd_count, NULL);
+    VkPhysicalDevice *pds = calloc(pd_count ? pd_count : 1, sizeof(*pds));
+    enum_pd(instance, &pd_count, pds);
+
+    for (uint32_t i = 0; i < pd_count; i++) {
+        VkPhysicalDeviceVulkan13Properties v13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES };
+        VkPhysicalDeviceVulkan12Properties v12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES };
+        VkPhysicalDeviceVulkan11Properties v11 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES };
+        VkPhysicalDeviceDriverProperties driver = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+        VkPhysicalDeviceMaintenance3Properties maint3 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES };
+        v12.pNext = &v13;
+        v11.pNext = &v12;
+        driver.pNext = &v11;
+        maint3.pNext = &driver;
+        VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        p2.pNext = &maint3;
+        props2(pds[i], &p2);
+        printf("[tool sweep] %s: updateAfterBind=%u subgroupSize=%u driverID=%d\n",
+               p2.properties.deviceName, v12.robustBufferAccessUpdateAfterBind, v11.subgroupSize, driver.driverID);
+
+        VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+        VkPhysicalDeviceVulkan12Features f12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+        VkPhysicalDeviceVulkan11Features f11 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
+        f12.pNext = &f13;
+        f11.pNext = &f12;
+        VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        f2.pNext = &f11;
+        features2(pds[i], &f2);
+        printf("[tool sweep] chained features: timelineSemaphore=%u synchronization2=%u dynamicRendering=%u\n",
+               f12.timelineSemaphore, f13.synchronization2, f13.dynamicRendering);
+
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT
+        };
+        VkPhysicalDeviceMemoryProperties2 m2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2 };
+        m2.pNext = &budget;
+        mem2(pds[i], &m2);
+        printf("[tool sweep] memory types=%u heap budget[0]=%llu KiB\n", m2.memoryProperties.memoryTypeCount,
+               (unsigned long long)budget.heapBudget[0] / 1024);
+
+        uint32_t qf_count = 0;
+        qf2(pds[i], &qf_count, NULL);
+        VkQueueFamilyProperties2 *qfs = calloc(qf_count ? qf_count : 1, sizeof(*qfs));
+        for (uint32_t q = 0; q < qf_count; q++) qfs[q].sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2;
+        qf2(pds[i], &qf_count, qfs);
+        printf("[tool sweep] queue families via Properties2: %u (first has %u queues)\n", qf_count,
+               qf_count ? qfs[0].queueFamilyProperties.queueCount : 0);
+        free(qfs);
+
+        VkPhysicalDeviceImageFormatInfo2 info = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2 };
+        info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        info.type = VK_IMAGE_TYPE_2D;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        VkImageFormatProperties2 props = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2 };
+        VkResult ir = image2(pds[i], &info, &props);
+        printf("[tool sweep] image format properties: %d maxExtent=%u\n", ir,
+               props.imageFormatProperties.maxExtent.width);
+
+        VkPhysicalDeviceSparseImageFormatInfo2 sinfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_INFO_2 };
+        sinfo.format = info.format;
+        sinfo.type = info.type;
+        sinfo.tiling = info.tiling;
+        sinfo.usage = info.usage;
+        sinfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        uint32_t sparse_count = 0;
+        sparse2(pds[i], &sinfo, &sparse_count, NULL);
+        printf("[tool sweep] sparse image format properties count=%u\n", sparse_count);
+
+        dump_device_extensions(dev_ext, pds[i]);
+    }
+
+    free(pds);
+    free(exts);
+    free(names);
+    if (destroy_inst) destroy_inst(instance, NULL);
+    printf("[tool sweep] done\n");
+    return 0;
+}
+
 static void dump_device_extensions(PFN_vkEnumerateDeviceExtensionProperties fn, VkPhysicalDevice pd)
 {
     uint32_t count = 0;
@@ -231,5 +367,6 @@ int main(int argc, char **argv)
     free(devices);
 
     printf("\n%s\n", failures == 0 ? "M1 loopback: PASS" : "M1 loopback: FAIL");
-    return failures == 0 ? 0 : 1;
+    int sweep = tool_style_sweep(gipa);
+    return (failures == 0 && sweep == 0) ? 0 : 1;
 }
