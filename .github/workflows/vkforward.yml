@@ -43,7 +43,24 @@ jobs:
       - name: Loopback check, forwarded properties come back intact
         env:
           VKFW_DRIVER: /usr/lib/aarch64-linux-gnu/libvulkan_lvp.so
-        run: tools/vkforward/build-linux/vkfw_loopback /tmp/vkfw-loopback.sock
+        # A hang has to say where it hung. Both halves live in this process, so
+        # a driver that never answers leaves nothing behind but a job that runs
+        # until it is killed, with only whatever made it to stdout. A watchdog
+        # attaches gdb and prints every thread's stack before killing it.
+        run: |
+          tools/vkforward/build-linux/vkfw_loopback /tmp/vkfw-loopback.sock &
+          pid=$!
+          ( sleep 120
+            if kill -0 "$pid" 2>/dev/null; then
+              echo "::error::loopback hung; stacks of the threads that are stuck:"
+              gdb -batch -ex "thread apply all bt" -p "$pid" 2>&1 | head -80
+              kill -ABRT "$pid" 2>/dev/null
+            fi ) &
+          watchdog=$!
+          wait "$pid"
+          rc=$?
+          kill "$watchdog" 2>/dev/null || true
+          exit "$rc"
 
       - name: Run the ICD through the real loader
         env:
