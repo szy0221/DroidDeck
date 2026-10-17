@@ -86,6 +86,14 @@ def main() -> int:
     rows.sort()
     rows = [r for r in rows if not (r[0] in seen or seen.add(r[0]))]
 
+    # The feature structs among them: VkPhysicalDevice*Features*, i.e. nodes
+    # whose only payload is VkBool32 flags. Name-based, because the shape is
+    # what the name says and there is no field list here to inspect.
+    def is_feature(name: str) -> bool:
+        return name.startswith("VkPhysicalDevice") and "Features" in name
+
+    features = sorted(value for value, name in rows if is_feature(name))
+
     source, include_dir = measure(header, [name for _, name in rows])
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "probe.c")
@@ -131,6 +139,7 @@ def main() -> int:
         "#ifndef VKFW_PNEXT_SIZES_H",
         "#define VKFW_PNEXT_SIZES_H",
         "",
+        "#include <stdbool.h>",
         "#include <stddef.h>",
         "#include <stdint.h>",
         "",
@@ -142,6 +151,12 @@ def main() -> int:
         "",
         "/* 0 means 'unknown sType'; the caller must drop such nodes. */",
         "size_t vkfw_pnext_size(uint32_t sType);",
+        "",
+        "/* True for the VkPhysicalDevice*Features* structs: nodes made only of",
+        " * VkBool32 flags. Knowing which nodes those are is what lets a caller",
+        " * ask the driver what it really has and clear the flags it has not,",
+        " * instead of handing over a chain the driver refuses as a whole. */",
+        "bool vkfw_pnext_is_features(uint32_t sType);",
         "",
         "#ifdef __cplusplus",
         "}",
@@ -182,6 +197,32 @@ def main() -> int:
         "    if (lo < sizeof(kSizes) / sizeof(kSizes[0]) && kSizes[lo].sType == sType)",
         "        return (size_t)kSizes[lo].size;",
         "    return 0;",
+        "}",
+        "",
+    ]
+
+    if not features:
+        print("no feature structs found in this header; is it a vulkan_core.h?", file=sys.stderr)
+        return 1
+
+    c += [
+        "/* sTypes of the VkPhysicalDevice*Features* structs, ascending. */",
+        "static const uint32_t kFeatureTypes[] = {",
+    ]
+    c += [f"    {value}," for value in features]
+    c += [
+        "};",
+        "",
+        "bool vkfw_pnext_is_features(uint32_t sType)",
+        "{",
+        "    size_t lo = 0, hi = sizeof(kFeatureTypes) / sizeof(kFeatureTypes[0]);",
+        "    while (lo < hi) {",
+        "        size_t mid = lo + (hi - lo) / 2;",
+        "        if (kFeatureTypes[mid] < sType) lo = mid + 1;",
+        "        else hi = mid;",
+        "    }",
+        "    return lo < sizeof(kFeatureTypes) / sizeof(kFeatureTypes[0]) &&",
+        "           kFeatureTypes[lo] == sType;",
         "}",
         "",
     ]

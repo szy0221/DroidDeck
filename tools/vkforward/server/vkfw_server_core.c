@@ -1,10 +1,12 @@
 #include "vkfw_server_core.h"
 #include "vkfw_transport.h"
+#include "vkfw_pnext_sizes.h"
 
 #include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -983,6 +985,140 @@ static void h_get_external_sync_properties(struct vkfw_request *req, void *is_fe
     }
 }
 
+/* What the real driver says this device has. NULL means we could not ask.
+   The caller frees with vkfw_free_ext_names. */
+static char **vkfw_device_ext_names(VkInstance instance, VkPhysicalDevice pd, uint32_t *out_count)
+{
+    *out_count = 0;
+    PFN_vkEnumerateDeviceExtensionProperties fn =
+        (PFN_vkEnumerateDeviceExtensionProperties)vkfw_instance_proc(instance,
+                                                                     "vkEnumerateDeviceExtensionProperties");
+    if (!fn) return NULL;
+
+    uint32_t count = 0;
+    VkResult r = fn(pd, NULL, &count, NULL);
+    if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || count == 0) return NULL;
+
+    VkExtensionProperties *props = calloc(count, sizeof(*props));
+    if (!props) return NULL;
+    r = fn(pd, NULL, &count, props);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) { free(props); return NULL; }
+
+    char **names = calloc(count, sizeof(char *));
+    if (!names) { free(props); return NULL; }
+    for (uint32_t i = 0; i < count; i++) {
+        size_t n = strlen(props[i].extensionName) + 1;
+        names[i] = malloc(n);
+        if (names[i]) memcpy(names[i], props[i].extensionName, n);
+    }
+    free(props);
+    *out_count = count;
+    return names;
+}
+
+static void vkfw_free_ext_names(char **names, uint32_t count)
+{
+    if (!names) return;
+    for (uint32_t i = 0; i < count; i++) free(names[i]);
+    free(names);
+}
+
+static bool vkfw_ext_supported(char **names, uint32_t count, const char *want)
+{
+    for (uint32_t i = 0; i < count; i++)
+        if (names[i] && strcmp(names[i], want) == 0) return true;
+    return false;
+}
+
+/* VkPhysicalDeviceFeatures2: when a caller puts this in the pNext chain it is
+   the one describing the features, and VkDeviceCreateInfo.pEnabledFeatures has
+   to stay NULL - passing both is not valid, and some drivers refuse the whole
+   create over it rather than ignoring the older field. */
+#define VKFW_STYPE_PHYSICAL_DEVICE_FEATURES_2 1000059000u
+
+/* Every Vulkan struct starts this way, which is enough to walk and relink a
+   chain without naming the type. */
+typedef struct vkfw_node_hdr {
+    uint32_t sType;
+    void *pNext;
+} vkfw_node_hdr;
+
+static bool vkfw_chain_has_sType(const vkfw_chain *c, uint32_t sType)
+{
+    for (uint32_t i = 0; i < c->count; i++)
+        if (c->v[i].sType == sType) return true;
+    return false;
+}
+
+/*
+ * Clear every feature flag the driver does not actually have.
+ *
+ * gamescope asks for the feature set of a desktop GPU - dynamic rendering,
+ * timeline semaphores, scalar block layout, robustness2 - because that is what
+ * an AMD or Intel part has. A phone driver asked for a flag it does not have
+ * may answer VK_ERROR_INITIALIZATION_FAILED for the whole create rather than
+ * naming the one thing it cannot do, which kills the session before anything
+ * reaches the screen. So: ask the driver for the same structs, and keep the
+ * intersection. Returns how many flags that turned off.
+ */
+static uint32_t vkfw_chain_mask_features(VkInstance instance, VkPhysicalDevice pd, vkfw_chain *c)
+{
+    PFN_vkGetPhysicalDeviceFeatures2 get =
+        (PFN_vkGetPhysicalDeviceFeatures2)vkfw_instance_proc(instance, "vkGetPhysicalDeviceFeatures2");
+    if (!get || !c || c->count == 0) return 0;
+
+    void **mirror = calloc(c->count, sizeof(*mirror));
+    if (!mirror) return 0;
+
+    VkPhysicalDeviceFeatures2 root = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    vkfw_node_hdr *head = NULL, *tail = NULL;
+
+    for (uint32_t i = 0; i < c->count; i++) {
+        if (!vkfw_pnext_is_features(c->v[i].sType)) continue;
+        /* The query root is that very struct, so reuse it instead of putting
+           the same sType in the chain twice. */
+        if (c->v[i].sType == VKFW_STYPE_PHYSICAL_DEVICE_FEATURES_2) {
+            mirror[i] = &root;
+            continue;
+        }
+        void *q = calloc(1, c->v[i].size);
+        if (!q) continue;
+        ((vkfw_node_hdr *)q)->sType = c->v[i].sType;
+        mirror[i] = q;
+        if (!head) head = (vkfw_node_hdr *)q;
+        else tail->pNext = q;
+        tail = (vkfw_node_hdr *)q;
+    }
+    root.pNext = head;
+    get(pd, &root);
+
+    uint32_t cleared = 0;
+    const size_t body = offsetof(vkfw_node_hdr, pNext) + sizeof(void *);
+    for (uint32_t i = 0; i < c->count; i++) {
+        if (!mirror[i]) continue;
+        uint8_t *want = (uint8_t *)c->v[i].node;
+        uint8_t *have = (uint8_t *)mirror[i];
+        size_t n = c->v[i].size;
+        /* Only the flags: sType and pNext belong to the chain, not to the
+           features, and must survive untouched. */
+        for (size_t off = body; off + sizeof(uint32_t) <= n; off += sizeof(uint32_t)) {
+            uint32_t w = 0, h = 0;
+            memcpy(&w, want + off, sizeof(w));
+            memcpy(&h, have + off, sizeof(h));
+            uint32_t keep = w & h;
+            if (keep != w) {
+                memcpy(want + off, &keep, sizeof(keep));
+                cleared++;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < c->count; i++)
+        if (mirror[i] && mirror[i] != (void *)&root) free(mirror[i]);
+    free(mirror);
+    return cleared;
+}
+
 static void h_create_device(struct vkfw_request *req, void *unused)
 {
     (void)unused;
@@ -1043,13 +1179,112 @@ static void h_create_device(struct vkfw_request *req, void *unused)
     info.ppEnabledLayerNames = (const char *const *)layers;
     info.enabledExtensionCount = ext_count;
     info.ppEnabledExtensionNames = (const char *const *)exts;
-    info.pEnabledFeatures = &features;
+    /* If the chain carries VkPhysicalDeviceFeatures2 it is the one that
+       describes the features, and then this older field has to stay NULL. */
+    info.pEnabledFeatures =
+        vkfw_chain_has_sType(&chain, VKFW_STYPE_PHYSICAL_DEVICE_FEATURES_2) ? NULL : &features;
 
     VkDevice device = VK_NULL_HANDLE;
     VkResult r = create(pd, &info, NULL, &device);
     if (r != VK_SUCCESS) {
-        LOGE("vkCreateDevice failed (%d), %u extensions requested", r, ext_count);
-        for (uint32_t i = 0; i < ext_count; i++) LOGE("  %s", exts[i]);
+        /*
+         * gamescope asks for what a desktop AMD or Intel part has, both in the
+         * extension list and in the feature chain, and a phone driver refuses
+         * with VK_ERROR_INITIALIZATION_FAILED instead of naming the one thing
+         * it cannot do. The session then dies before anything is on screen.
+         * So take the request apart and put it back together as something the
+         * driver will accept, widest first, logging every step: the next
+         * report then says which part of the request the driver rejected.
+         */
+        VkInstance inst = vkfw_instance_of(req->conn, pd_id);
+        LOGE("vkCreateDevice failed (%d), %u extensions, %u chain nodes",
+             r, ext_count, chain.count);
+        for (uint32_t i = 0; i < ext_count; i++) LOGE("  requested %s", exts[i]);
+
+        /* 1. Keep only the feature flags the driver says it has. */
+        uint32_t cleared = vkfw_chain_mask_features(inst, pd, &chain);
+        if (cleared) {
+            LOGE("  %u feature flag(s) the driver does not have cleared", cleared);
+            info.pNext = vkfw_chain_head(&chain);
+            VkDevice d2 = VK_NULL_HANDLE;
+            VkResult r2 = create(pd, &info, NULL, &d2);
+            LOGE("vkCreateDevice with supported features only: %d", r2);
+            if (r2 == VK_SUCCESS) { device = d2; r = VK_SUCCESS; }
+        } else {
+            LOGE("  every requested feature flag is one the driver reports");
+        }
+
+        /* 2. Extensions the driver does not list at all. */
+        uint32_t have_count = 0;
+        char **have = vkfw_device_ext_names(inst, pd, &have_count);
+        if (r != VK_SUCCESS && !have) {
+            LOGE("  could not enumerate what the driver supports");
+        } else if (r != VK_SUCCESS) {
+            const char **kept = calloc(ext_count ? ext_count : 1, sizeof(*kept));
+            uint32_t kept_count = 0;
+            for (uint32_t i = 0; kept && i < ext_count; i++) {
+                if (vkfw_ext_supported(have, have_count, exts[i]))
+                    kept[kept_count++] = exts[i];
+                else
+                    LOGE("  dropping %s (the driver does not list it)", exts[i]);
+            }
+            if (kept && kept_count != ext_count) {
+                info.enabledExtensionCount = kept_count;
+                info.ppEnabledExtensionNames = kept;
+                VkDevice retry = VK_NULL_HANDLE;
+                VkResult r2 = create(pd, &info, NULL, &retry);
+                LOGE("vkCreateDevice with the %u extension(s) the driver lists: %d",
+                     kept_count, r2);
+                if (r2 == VK_SUCCESS) { device = retry; r = VK_SUCCESS; }
+            }
+            free(kept);
+
+            /* 3. Still refused: try each extension alone so the log names the
+                 one that breaks it, since a driver can list an extension and
+                 still refuse the combination it was asked for. */
+            if (r != VK_SUCCESS) {
+                PFN_vkDestroyDevice destroy =
+                    (PFN_vkDestroyDevice)vkfw_instance_proc(inst, "vkDestroyDevice");
+                for (uint32_t i = 0; i < ext_count; i++) {
+                    const char *one = exts[i];
+                    info.enabledExtensionCount = 1;
+                    info.ppEnabledExtensionNames = &one;
+                    VkDevice probe = VK_NULL_HANDLE;
+                    VkResult rp = create(pd, &info, NULL, &probe);
+                    LOGE("  %s on its own: %d", exts[i], rp);
+                    if (rp == VK_SUCCESS && probe && destroy) destroy(probe, NULL);
+                }
+                info.enabledExtensionCount = 0;
+                info.ppEnabledExtensionNames = NULL;
+                VkDevice bare = VK_NULL_HANDLE;
+                VkResult rb = create(pd, &info, NULL, &bare);
+                LOGE("vkCreateDevice with no extensions at all: %d", rb);
+                if (rb == VK_SUCCESS) { device = bare; r = VK_SUCCESS; }
+            }
+        }
+
+        /* 4. Give up on the feature chain: a device with default features is
+              still far more useful than no device. */
+        if (r != VK_SUCCESS) {
+            info.pNext = NULL;
+            info.pEnabledFeatures = &features;
+            info.enabledExtensionCount = ext_count;
+            info.ppEnabledExtensionNames = (const char *const *)exts;
+            VkDevice d4 = VK_NULL_HANDLE;
+            VkResult r4 = create(pd, &info, NULL, &d4);
+            LOGE("vkCreateDevice without the feature chain: %d", r4);
+            if (r4 == VK_SUCCESS) { device = d4; r = VK_SUCCESS; }
+        }
+        if (r != VK_SUCCESS) {
+            info.enabledExtensionCount = 0;
+            info.ppEnabledExtensionNames = NULL;
+            VkDevice d5 = VK_NULL_HANDLE;
+            VkResult r5 = create(pd, &info, NULL, &d5);
+            LOGE("vkCreateDevice with nothing requested at all: %d", r5);
+            if (r5 == VK_SUCCESS) { device = d5; r = VK_SUCCESS; }
+        }
+
+        vkfw_free_ext_names(have, have_count);
     }
     vkfw_buf_put_result(req->out, r);
     if (r == VK_SUCCESS)

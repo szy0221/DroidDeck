@@ -3,6 +3,7 @@
 #ifndef VKFW_PNEXT_SIZES_H
 #define VKFW_PNEXT_SIZES_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -14,6 +15,12 @@ extern "C" {
 
 /* 0 means 'unknown sType'; the caller must drop such nodes. */
 size_t vkfw_pnext_size(uint32_t sType);
+
+/* True for the VkPhysicalDevice*Features* structs: nodes made only of
+ * VkBool32 flags. Knowing which nodes those are is what lets a caller
+ * ask the driver what it really has and clear the flags it has not,
+ * instead of handing over a chain the driver refuses as a whole. */
+bool vkfw_pnext_is_features(uint32_t sType);
 
 #ifdef __cplusplus
 }
