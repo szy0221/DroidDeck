@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #define VK_NO_PROTOTYPES 1
@@ -1253,10 +1254,13 @@ static void h_get_image_sparse_memory_requirements(struct vkfw_request *req, voi
 
 static int vkfw_make_memfd(uint64_t size)
 {
-#if defined(__NR_memfd_create)
-    int fd = (int)syscall(__NR_memfd_create, "vkforward", MFD_CLOEXEC);
-#else
     int fd = -1;
+#if defined(SYS_memfd_create)
+    fd = (int)syscall(SYS_memfd_create, "vkforward", MFD_CLOEXEC);
+#elif defined(__NR_memfd_create)
+    fd = (int)syscall(__NR_memfd_create, "vkforward", MFD_CLOEXEC);
+#else
+    errno = ENOSYS;
 #endif
     if (fd < 0) return -1;
     if (ftruncate(fd, (off_t)size) != 0) {
@@ -1309,6 +1313,9 @@ static void h_allocate_memory(struct vkfw_request *req, void *unused)
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     int backing = vkfw_make_memfd(rounded);
+    if (backing < 0)
+        LOGW("no memfd for %llu bytes (%s): this allocation cannot be mapped or exported",
+             (unsigned long long)info.allocationSize, strerror(errno));
 
     if (backing >= 0) {
         import.fd = backing;
