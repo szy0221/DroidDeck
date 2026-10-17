@@ -8,6 +8,8 @@ import time
 import unittest
 
 BIN = Path(__file__).resolve().parents[1] / 'linuxfs/overlay/usr/local/bin'
+# On Windows a bare "bash" resolves to the WSL shim; let a runner point at a real one.
+BASH = os.environ.get('DROIDDECK_TEST_BASH', 'bash')
 
 
 class DesktopSteamLaunchTest(unittest.TestCase):
@@ -28,7 +30,7 @@ class DesktopSteamLaunchTest(unittest.TestCase):
             '/usr/local/bin/droiddeck-session', str(supervisor)))
 
     def launch(self, *args):
-        return subprocess.run(['bash', str(self.launcher), *args], env=self.env,
+        return subprocess.run([BASH, str(self.launcher), *args], env=self.env,
                               text=True, capture_output=True)
 
     def test_desktop_keeps_display_and_does_not_request_session_switch(self):
@@ -72,7 +74,7 @@ class DesktopSteamLaunchTest(unittest.TestCase):
         steam.chmod(0o755)
         with lock.open('w') as handle:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            process = subprocess.Popen(['bash', str(self.launcher), 'desktop'], env=self.env,
+            process = subprocess.Popen([BASH, str(self.launcher), 'desktop'], env=self.env,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
                 time.sleep(0.7)
@@ -88,6 +90,29 @@ class DesktopSteamLaunchTest(unittest.TestCase):
                 if process.poll() is None:
                     process.kill()
                     process.communicate()
+
+    def test_a_click_while_the_client_is_still_being_set_up_says_so(self):
+        """On a fresh home the client downloads for minutes: an early click is not a broken one."""
+        lock = self.root / 'cache/droiddeck/steam-desktop.lock'
+        lock.parent.mkdir(parents=True)
+        pgrep = self.root / 'pgrep'
+        pgrep.write_text('#!/bin/bash\necho 4242\n')
+        pgrep.chmod(0o755)
+        env = dict(self.env, PATH=str(self.root) + os.pathsep + os.environ.get('PATH', ''))
+        with lock.open('w') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            process = subprocess.Popen([BASH, str(self.launcher), 'desktop'], env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                time.sleep(1.5)
+                self.assertIsNone(process.poll(), 'a launch that is still setting up must keep waiting')
+                process.kill()
+                _, stderr = process.communicate()
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+        self.assertIn('still being set up', stderr)
 
     def test_big_picture_requests_explicit_handoff(self):
         result = self.launch('bigpicture')
@@ -111,7 +136,7 @@ class DesktopSteamLaunchTest(unittest.TestCase):
         for desktop, ui, software in [('1', 'desktop', True), ('1', 'bigpicture', False), ('', 'desktop', False)]:
             with self.subTest(desktop=desktop, ui=ui):
                 env = dict(self.env, BL_DESKTOP=desktop, BL_STEAM_UI=ui)
-                result = subprocess.check_output(['bash', '-c', setup + '\nprintf "%s\\n" "${_bl_cef[@]}"'],
+                result = subprocess.check_output([BASH, '-c', setup + '\nprintf "%s\\n" "${_bl_cef[@]}"'],
                                                  env=env, text=True)
                 self.assertEqual('-cef-disable-gpu' in result, software)
                 self.assertEqual('-cef-use-angle=vulkan' in result, not software)

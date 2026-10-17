@@ -36,6 +36,17 @@ class DesktopLocaleTest(unittest.TestCase):
         self.assertIn('-> unset', result.stdout)
         self.assertIn('LANGUAGE=unset', result.stdout)
 
+    def test_it_sets_the_language_even_when_the_locale_is_not_generated(self):
+        """Translations come from LANGUAGE/LANG, not from setlocale(), so this still works."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as scratch:
+            stub = Path(scratch) / 'locale'
+            stub.write_text('#!/bin/bash\n[ "$1" = "-a" ] && printf "C\\nC.UTF-8\\nPOSIX\\n"\nexit 0\n')
+            stub.chmod(0o755)
+            result = self.run_locale(BL_STEAM_LANGUAGE='schinese',
+                                     PATH=str(Path(scratch)) + os.pathsep + os.environ.get('PATH', ''))
+        self.assertIn('LANG=zh_CN.UTF-8 LANGUAGE=zh_CN', result.stdout)
+
     def test_it_reports_what_the_runtime_can_actually_do(self):
         """Whether Plasma ends up translated depends on files the rootfs may not ship."""
         result = self.run_locale(BL_STEAM_LANGUAGE='schinese')

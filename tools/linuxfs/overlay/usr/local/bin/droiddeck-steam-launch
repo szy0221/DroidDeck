@@ -11,6 +11,19 @@ case $target in
   *) url=steam://rungameid/$target ;;
 esac
 
+desktop_note() {
+  # A click that only waits has nothing to show for itself, so put a word on the desktop
+  # when the session can. Never fatal: this is a nicety, not a step in the launch.
+  local msg=$1
+  # without a session bus there is nobody to notify, and the call would just hang
+  [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || return 0
+  command -v notify-send >/dev/null 2>&1 &&
+    notify-send -a DroidDeck "$msg" >/dev/null 2>&1 && return 0
+  command -v kdialog >/dev/null 2>&1 &&
+    kdialog --title DroidDeck --passivepopup "$msg" 10 >/dev/null 2>&1 && return 0
+  return 0
+}
+
 if [ "$ui" = desktop ] && [ "${BL_DESKTOP:-}" = 1 ]; then
   # A click on the desktop icon leaves this process with nowhere to print, and the session
   # it starts is nested, so a silent failure here is indistinguishable from a dead icon.
@@ -26,16 +39,30 @@ if [ "$ui" = desktop ] && [ "${BL_DESKTOP:-}" = 1 ]; then
   mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/droiddeck"
   exec 9>"${XDG_CACHE_HOME:-$HOME/.cache}/droiddeck/steam-desktop.lock"
   if ! flock -n 9; then
-    # stderr, not stdout: stdout is the client's own channel and is asserted on
+    # Another launch already owns the client. On a fresh home that means the client is still
+    # downloading, which takes minutes and has no window to show for it, so a click looks
+    # dead when it is only early. Wait it out while that launch is still doing something,
+    # and say so where a user can see it. stderr, not stdout: stdout is the client's channel
+    # and the tests assert on it.
     echo "== the desktop lock is held, waiting for the running client" >&2
-    for ((attempt = 0; attempt < 180; attempt++)); do
+    desktop_note "Steam is still being set up; it opens as soon as it is ready."
+    for ((attempt = 0; attempt < 1200; attempt++)); do
       pid=$(cat "$HOME/.steam/steam.pid" 2>/dev/null || true)
       if [ -p "$HOME/.steam/steam.pipe" ] && [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
         echo "== handing $* to the running client (pid $pid)" >&2
         exec "$steam_root/steamrtarm64/steam" -nobigpicture -no-cef-sandbox \
           -cef-ozone-platform=x11 -cef-disable-gpu "${url:-steam://open/library}"
       fi
-      [ $((attempt % 20)) = 0 ] && echo "== still waiting: pid=${pid:-none} pipe=$( [ -p "$HOME/.steam/steam.pipe" ] && echo yes || echo no)" >&2
+      if [ $((attempt % 20)) = 0 ]; then
+        echo "== still waiting: pid=${pid:-none} pipe=$( [ -p "$HOME/.steam/steam.pipe" ] && echo yes || echo no)" >&2
+        setting_up=$(pgrep -f 'droiddeck-session steam|droiddeck-steam-install' 2>/dev/null | tr '\n' ' ')
+        if [ -n "$setting_up" ]; then
+          echo "== still waiting: the client is still being set up ($setting_up)" >&2
+        elif [ "$attempt" -ge 120 ]; then
+          echo "== the client did not come up and nothing is starting it any more" >&2
+          break
+        fi
+      fi
       sleep 0.5
     done
     echo "droiddeck-steam-launch: the desktop client did not become ready" >&2

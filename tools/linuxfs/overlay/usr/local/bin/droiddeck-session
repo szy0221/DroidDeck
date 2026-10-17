@@ -267,13 +267,23 @@ desktop_locale() {
        "zh_CN=$(ls -d /usr/share/locale/zh_CN 2>/dev/null || echo none)" \
        "generated=$(locale -a 2>/dev/null | grep -c . )"
   [ -n "$tag" ] || return 0
-  export LANGUAGE=$tag
+  # Translations are looked up from LANGUAGE/LANG, not from what setlocale() managed to
+  # load, so an ungenerated locale still gets Plasma into that language - and on this
+  # board /usr/share/locale/zh_CN is present while locale -a lists only C, C.UTF-8 and
+  # POSIX. Generate it when the runtime can, but set the variables either way.
+  export LANGUAGE=$tag LANG=${tag}.UTF-8
   if locale -a 2>/dev/null | grep -qix -e "${tag}.utf-8" -e "${tag}.utf8" -e "$tag"; then
-    export LANG=${tag}.UTF-8
     echo "== locale: the desktop runs in $LANG"
-  else
-    echo "== locale: $tag is not generated in this runtime; the desktop keeps the C locale"
+    return 0
   fi
+  if [ ! -f "$HOME/.droiddeck-locale-tried" ] && command -v locale-gen >/dev/null 2>&1; then
+    : > "$HOME/.droiddeck-locale-tried" 2>/dev/null || true
+    grep -q "^#\?\s*${tag}\.UTF-8" /etc/locale.gen 2>/dev/null ||
+      printf '%s.UTF-8 UTF-8\n' "$tag" >> /etc/locale.gen 2>/dev/null || true
+    sed -i "s/^#\s*\(${tag}\.UTF-8\)/\1/" /etc/locale.gen 2>/dev/null || true
+    locale-gen >/dev/null 2>&1 || true
+  fi
+  echo "== locale: $LANG set; $(locale -a 2>/dev/null | grep -cix -e "${tag}.utf-8" -e "${tag}.utf8" -e "$tag") generated match(es)"
 }
 
 if [ -z "${BL_INSIDE:-}" ]; then
