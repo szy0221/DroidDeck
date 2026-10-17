@@ -1252,6 +1252,39 @@ static void h_get_image_sparse_memory_requirements(struct vkfw_request *req, voi
 #define MFD_CLOEXEC 1u
 #endif
 
+/*
+ * Whether the driver will import a descriptor of this kind at all.
+ *
+ * Asking first is the difference between a fallback and a hang. lavapipe
+ * rejects an opaque fd outright, then spends minutes on a dma-buf it cannot
+ * use, and the caller waits with no way to report why; a driver is entitled
+ * to take its time over an import it said it supported, not over one it never
+ * claimed to.
+ */
+static bool vkfw_memory_importable(struct vkfw_conn *c, uint64_t dev_id,
+                                   VkExternalMemoryHandleTypeFlagBits type)
+{
+    if (dev_id == 0 || dev_id > c->handles.count) return false;
+    uint64_t pd_id = c->handles.v[dev_id - 1].owner;
+    VkPhysicalDevice pd = (VkPhysicalDevice)vkfw_handle_get(&c->handles, pd_id, VKFW_OBJ_PHYSICAL_DEVICE);
+    if (!pd) return false;
+
+    PFN_vkGetPhysicalDeviceExternalBufferProperties fn =
+        (PFN_vkGetPhysicalDeviceExternalBufferProperties)vkfw_instance_proc(
+            vkfw_instance_of(c, dev_id), "vkGetPhysicalDeviceExternalBufferProperties");
+    if (!fn) return false;
+
+    VkPhysicalDeviceExternalBufferInfo ask = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO
+    };
+    ask.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    ask.handleType = type;
+    VkExternalBufferProperties props = { VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES };
+    fn(pd, &ask, &props);
+    return (props.externalMemoryProperties.externalMemoryFeatures &
+            VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
+}
+
 static int vkfw_make_memfd(uint64_t size)
 {
     int fd = -1;
@@ -1323,6 +1356,8 @@ static void h_allocate_memory(struct vkfw_request *req, void *unused)
         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
     };
 
+    static bool imports_reported = false;
+
     VkImportMemoryFdInfoKHR import = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR };
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -1331,7 +1366,18 @@ static void h_allocate_memory(struct vkfw_request *req, void *unused)
         LOGW("no memfd for %llu bytes (%s): this allocation cannot be mapped or exported",
              (unsigned long long)info.allocationSize, strerror(errno));
 
+    bool can_opaque = vkfw_memory_importable(req->conn, dev_id,
+                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
+    bool can_dma_buf = vkfw_memory_importable(req->conn, dev_id,
+                                              VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+    if (!imports_reported) {
+        imports_reported = true;
+        LOGI("memory imports: opaque_fd=%d dma_buf=%d", can_opaque, can_dma_buf);
+    }
+
     for (size_t i = 0; backing >= 0 && i < sizeof(kImportAs) / sizeof(kImportAs[0]); i++) {
+        if (kImportAs[i] == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT && !can_opaque) continue;
+        if (kImportAs[i] == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT && !can_dma_buf) continue;
         import.handleType = kImportAs[i];
         import.fd = backing;
         import.pNext = dedicated;
