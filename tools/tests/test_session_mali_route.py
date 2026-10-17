@@ -59,7 +59,7 @@ class MaliSteamRouteTest(unittest.TestCase):
         self.addCleanup(listener.close)
         seen = self.root / 'seen'
         fake = self.root / 'launch'
-        fake.write_text('#!/bin/bash\nprintf "%s\\n" "$BL_DESKTOP" "$@" > %s\nexit 0\n' % (seen))
+        fake.write_text('#!/bin/bash\nprintf "%s\\n" "$BL_DESKTOP" "$@" > "' + str(seen) + '"\nexit 0\n')
         fake.chmod(0o755)
         body = self.queued().read_text().replace('/usr/local/bin/droiddeck-steam-launch', str(fake))
         body = re.sub(r'sleep [0-9]+', 'sleep 0', body)
