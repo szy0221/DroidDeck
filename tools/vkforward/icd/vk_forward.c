@@ -204,9 +204,24 @@ static VkResult vkfw_vkEnumerateInstanceExtensionProperties(const char *layerNam
         vkfw_buf_free(&reply);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+
+    /* The WSI the ICD serves itself, appended after the driver's list. These
+     * are the ones a Wayland or X11 client insists on and an Android driver
+     * has never provided. The server stripped them out of the count above, so
+     * adding them back is what keeps the list whole. */
+    static const struct { const char *name; uint32_t version; } wsi[] = {
+        { "VK_KHR_surface", 25 },
+        { "VK_KHR_swapchain", 70 },
+        { "VK_KHR_wayland_surface", 6 },
+        { "VK_EXT_surface_maintenance1", 1 },
+    };
+    const uint32_t wsi_count = (uint32_t)(sizeof(wsi) / sizeof(wsi[0]));
+
     if (!pProperties) {
+        /* A count-only query still went out, so a driver that cannot be
+         * reached fails above rather than claiming to have extensions. */
         vkfw_buf_free(&reply);
-        *pPropertyCount = count;
+        *pPropertyCount = count + wsi_count;
         return VK_SUCCESS;
     }
 
@@ -234,29 +249,9 @@ static VkResult vkfw_vkEnumerateInstanceExtensionProperties(const char *layerNam
     }
     vkfw_buf_free(&reply);
 
-    /* The WSI the ICD serves itself, appended after the driver's list. These
-     * are the ones a Wayland or X11 client insists on and an Android driver
-     * has never provided. */
-    static const struct { const char *name; uint32_t version; } wsi[] = {
-        { "VK_KHR_surface", 25 },
-        { "VK_KHR_swapchain", 70 },
-        { "VK_KHR_wayland_surface", 6 },
-        { "VK_EXT_surface_maintenance1", 1 },
-    };
-    const uint32_t wsi_count = (uint32_t)(sizeof(wsi) / sizeof(wsi[0]));
-
-    if (!pProperties) {
-        /* A count-only query still has to have gone out, so a driver that is
-         * not reachable fails here rather than claiming to have extensions. */
-        vkfw_buf_free(&reply);
-        if (result != VK_SUCCESS) {
-            *pPropertyCount = 0;
-            return result;
-        }
-        *pPropertyCount = count + wsi_count;
-        return VK_SUCCESS;
-    }
-
+    /* Then the ones we answer for. A caller that sized its array from the
+     * count-only query can hold all of them; one that did not gets
+     * VK_INCOMPLETE and whatever the array had room left for. */
     for (uint32_t i = 0; i < wsi_count; i++) {
         if (wrote >= *pPropertyCount) {
             result = VK_INCOMPLETE;
