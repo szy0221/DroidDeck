@@ -28,7 +28,15 @@ URUNTIME = "/usr/local/lib/droiddeck/uruntime"
 HOST_PRELOAD = "/etc/ld.so.preload"
 FEX_APPID = "3127680"
 SNIPER_APPID = "1628350"
-INSTALL_DIRS = {FEX_APPID: "FEX-Emu", SNIPER_APPID: "SteamLinuxRuntime_sniper"}
+SOLDIER_APPID = "1391110"
+INSTALL_DIRS = {FEX_APPID: "FEX-Emu", SNIPER_APPID: "SteamLinuxRuntime_sniper",
+                SOLDIER_APPID: "SteamLinuxRuntime_soldier"}
+# FEX needs an x86 root filesystem. Steam Linux Runtime 3.0 (sniper) is the one
+# it is built around, but the arm64 client does not always make sniper
+# installable - on such a device the request is silently dropped and no x86 game
+# can ever start. Steam Linux Runtime 2.0 (soldier) is laid out the same way and
+# is already on disk whenever a title launches through it, so accept either.
+RUNTIME_PLATFORMS = ((SNIPER_APPID, "sniper_platform_"), (SOLDIER_APPID, "soldier_platform_"))
 MARKER = ".droiddeck-fex"
 LAYOUT = 1
 GUEST_LIBDIRS = (("x86_64", "lib/x86_64-linux-gnu"), ("i386", "lib/i386-linux-gnu"))
@@ -165,17 +173,21 @@ def platform_version(path):
 
 
 def runtime_platform():
-    runtime = app_dir(SNIPER_APPID)
-    if not runtime:
-        return None
-    try:
-        entries = os.listdir(runtime)
-    except OSError:
-        return None
-    platforms = [os.path.join(runtime, entry) for entry in entries if entry.startswith("sniper_platform_")]
-    platforms = [path for path in platforms if os.path.isdir(os.path.join(path, "files"))
-                 and os.path.isfile(os.path.join(path, "usr-mtree.txt.gz"))]
-    return max(platforms, key=platform_version, default=None)
+    for appid, prefix in RUNTIME_PLATFORMS:
+        runtime = app_dir(appid)
+        if not runtime:
+            continue
+        try:
+            entries = os.listdir(runtime)
+        except OSError:
+            continue
+        platforms = [os.path.join(runtime, entry) for entry in entries if entry.startswith(prefix)]
+        platforms = [path for path in platforms if os.path.isdir(os.path.join(path, "files"))
+                     and os.path.isfile(os.path.join(path, "usr-mtree.txt.gz"))]
+        found = max(platforms, key=platform_version, default=None)
+        if found:
+            return found
+    return None
 
 
 def unescape(raw):
@@ -336,7 +348,8 @@ def prepare():
             elif not fex["server"]:
                 missing.append("FEXServer beside %s" % fex["bin"])
             if not platform:
-                missing.append("Steam Linux Runtime 3.0 (sniper, Steam app %s)" % SNIPER_APPID)
+                missing.append("Steam Linux Runtime 3.0 (sniper, Steam app %s) or 2.0 (soldier, Steam app %s)"
+                               % (SNIPER_APPID, SOLDIER_APPID))
             requested = request_install()
             say("x86 Linux programs need %s; %s" % (" and ".join(missing),
                 "the Steam client was asked to install it" if requested else "open Steam once and it is installed for you"))
