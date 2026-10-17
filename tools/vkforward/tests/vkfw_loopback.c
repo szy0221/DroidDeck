@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #define VK_NO_PROTOTYPES 1
@@ -405,6 +406,92 @@ static int wsi_round_trip(PFN_vkGetInstanceProcAddr gipa)
     return failures;
 }
 
+/*
+ * Two clients at once, which is what a device does and a single test does not.
+ *
+ * A client opens the socket the first time it asks something and keeps it for
+ * as long as it lives. Serving connections one at a time therefore works for
+ * the first process and hangs the second, and a hang is not something the
+ * caller can report: it waits, gives up, and the app shows nothing useful.
+ * Steam asks about the driver from a helper while its client already holds a
+ * connection, which is exactly this shape.
+ *
+ * The first connection stays open on purpose - that is the whole point - and
+ * the second one is given a deadline, so a server that cannot serve two
+ * clients fails this instead of running until the job times out.
+ */
+static int raw_connect(const char *endpoint)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    socklen_t len = sizeof(addr);
+    if (endpoint[0] == '@') {
+        const char *name = endpoint + 1;
+        addr.sun_path[0] = '\0';
+        strncpy(addr.sun_path + 1, name, sizeof(addr.sun_path) - 2);
+        len = (socklen_t)(sizeof(sa_family_t) + 1 + strlen(name));
+    } else {
+        strncpy(addr.sun_path, endpoint, sizeof(addr.sun_path) - 1);
+    }
+    if (connect(fd, (struct sockaddr *)&addr, len) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool ask_instance_version(int fd)
+{
+    if (!vkfw_write_frame(fd, VKFW_CMD_ENUMERATE_INSTANCE_VERSION, 1, NULL, 0)) return false;
+    struct vkfw_header hdr;
+    vkfw_buf payload;
+    vkfw_buf_init(&payload);
+    bool ok = vkfw_read_frame(fd, &hdr, &payload);
+    vkfw_buf_free(&payload);
+    return ok && hdr.cmd == VKFW_CMD_ENUMERATE_INSTANCE_VERSION;
+}
+
+static int two_clients(const char *endpoint)
+{
+    int failures = 0;
+    printf("[clients] two connections at once\n");
+
+    int a = raw_connect(endpoint);
+    if (a < 0) {
+        printf("[clients]   first connection: FAILED\n");
+        return 1;
+    }
+    if (!ask_instance_version(a)) {
+        printf("[clients]   first client served: NO\n");
+        failures++;
+    } else {
+        printf("[clients]   first client served: yes (connection held open)\n");
+    }
+
+    int b = raw_connect(endpoint);
+    if (b < 0) {
+        printf("[clients]   second connection: FAILED\n");
+        failures++;
+    } else {
+        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+        setsockopt(b, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        if (!ask_instance_version(b)) {
+            printf("[clients]   second client served: NO - the server is stuck on the first\n");
+            failures++;
+        } else {
+            printf("[clients]   second client served: yes\n");
+        }
+        close(b);
+    }
+    close(a);
+    printf("[clients] done\n");
+    return failures;
+}
+
 int main(int argc, char **argv)
 {
     const char *driver = getenv("VKFW_DRIVER");
@@ -580,5 +667,7 @@ int main(int argc, char **argv)
     int sweep = tool_style_sweep(gipa);
     printf("\n[wsi] instance-level window system integration\n");
     int wsi = wsi_round_trip(gipa);
-    return (failures == 0 && sweep == 0 && wsi == 0) ? 0 : 1;
+    printf("\n");
+    int clients = two_clients(socket_ref);
+    return (failures == 0 && sweep == 0 && wsi == 0 && clients == 0) ? 0 : 1;
 }

@@ -3,6 +3,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1299,6 +1300,55 @@ void vkfw_serve_connection(int fd)
     LOGD("connection closed");
 }
 
+struct vkfw_conn_arg {
+    int fd;
+};
+
+static void *vkfw_conn_thread(void *p)
+{
+    struct vkfw_conn_arg *arg = (struct vkfw_conn_arg *)p;
+    int fd = arg->fd;
+    free(arg);
+    vkfw_serve_connection(fd);
+    return NULL;
+}
+
+/*
+ * One thread per connection, not one connection at a time.
+ *
+ * Serving a connection inline looks fine for as long as only one process ever
+ * talks to the driver, which is all a single test does. On a device it is not:
+ * a client opens the socket when it first asks a question and holds it for as
+ * long as it lives, so the second process to come along waits behind the first
+ * one forever with nothing to show for it. Steam asks about the driver from a
+ * helper process while the client holds a connection of its own, and what that
+ * looks like from the outside is not an error - it is a timeout, then another,
+ * and then the app giving up.
+ *
+ * The ICD serialises its own threads on one socket behind a lock, so these
+ * connections are separate clients, not one client's threads; the driver is
+ * thread-safe for separate objects, and each connection keeps its own handles.
+ */
+static void vkfw_serve_detached(int fd)
+{
+    struct vkfw_conn_arg *arg = malloc(sizeof(*arg));
+    if (!arg) {
+        LOGE("out of memory serving a connection");
+        close(fd);
+        return;
+    }
+    arg->fd = fd;
+
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, vkfw_conn_thread, arg) != 0) {
+        LOGE("pthread_create failed, dropping this connection");
+        free(arg);
+        close(fd);
+        return;
+    }
+    pthread_detach(thread);
+}
+
 int vkfw_server_main(int listen_fd)
 {
     for (;;) {
@@ -1307,6 +1357,6 @@ int vkfw_server_main(int listen_fd)
             if (errno == EINTR) continue;
             return -1;
         }
-        vkfw_serve_connection(client);
+        vkfw_serve_detached(client);
     }
 }
