@@ -66,9 +66,13 @@ bool vkfw_cur_strlist(vkfw_cur *c, uint32_t *count, char ***out);
 void vkfw_strlist_free(uint32_t count, char **list);
 
 /* ---- pNext chain ------------------------------------------------------ */
-/* Collect the caller's chain into `out` (used by the ICD when sending). */
+/* Collect the caller's chain into `out` (used by the ICD when sending). The
+ * nodes are borrowed, so vkfw_chain_free only releases the list. */
 bool vkfw_chain_collect(const void *head, vkfw_chain *out);
 void vkfw_chain_free(vkfw_chain *c);
+/* Release a chain built by vkfw_chain_parse, whose nodes are our own copies.
+ * Call it only once the driver is finished with them. */
+void vkfw_chain_release(vkfw_chain *c);
 /* Serialise a collected chain: [u32 count][per node: u32 size][bytes]. */
 void vkfw_chain_put(vkfw_buf *b, const vkfw_chain *c);
 /* Parse a serialised chain; nodes are malloc'd with a zero tail. */

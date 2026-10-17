@@ -205,6 +205,15 @@ void vkfw_chain_free(vkfw_chain *c)
     c->count = 0;
 }
 
+void vkfw_chain_release(vkfw_chain *c)
+{
+    if (!c) return;
+    for (uint32_t i = 0; i < c->count; i++) free(c->v[i].node);
+    free(c->v);
+    c->v = NULL;
+    c->count = 0;
+}
+
 void vkfw_chain_put(vkfw_buf *b, const vkfw_chain *c)
 {
     vkfw_buf_put_u32(b, c->count);

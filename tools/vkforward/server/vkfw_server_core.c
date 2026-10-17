@@ -119,6 +119,9 @@ enum vkfw_handle_type {
     VKFW_OBJ_QUEUE,
     VKFW_OBJ_IMAGE,
     VKFW_OBJ_DEVICE_MEMORY,
+    VKFW_OBJ_BUFFER,
+    VKFW_OBJ_FENCE,
+    VKFW_OBJ_SEMAPHORE,
 };
 
 struct vkfw_handle_slot {
@@ -1539,6 +1542,458 @@ static void h_free_memory(struct vkfw_request *req, void *unused)
     vkfw_buf_put_result(req->out, VK_SUCCESS);
 }
 
+/* ---- buffers ------------------------------------------------------------ */
+
+/*
+ * A buffer crosses the way an image does - struct with its pointers cleared,
+ * queue family array alongside - except that its pNext chain is forwarded.
+ * VkExternalMemoryBufferCreateInfo travels in that chain, and it is the only
+ * way a caller can say that the allocation behind this buffer has to be
+ * exportable; dropping it would quietly turn every exportable buffer into a
+ * private one and the dma-buf handed to the compositor would be refused.
+ */
+static VkResult vkfw_buffer_create_info(struct vkfw_request *req, VkBufferCreateInfo *info,
+                                        vkfw_chain *chain)
+{
+    if (!vkfw_cur_bytes(&req->in, info, sizeof(*info))) return VKFW_ERR_PROTOCOL;
+    info->pNext = NULL;
+    info->pQueueFamilyIndices = NULL;
+    info->queueFamilyIndexCount = 0;
+
+    uint32_t count = 0;
+    if (!vkfw_cur_u32(&req->in, &count)) return VKFW_ERR_PROTOCOL;
+    if (count > 64) return VKFW_ERR_PROTOCOL;
+    if (count == 0) return VK_SUCCESS;
+
+    uint32_t *indices = calloc(count, sizeof(*indices));
+    if (!indices) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!vkfw_cur_u32(&req->in, &indices[i])) {
+            free(indices);
+            return VKFW_ERR_PROTOCOL;
+        }
+    }
+    info->queueFamilyIndexCount = count;
+    info->pQueueFamilyIndices = indices;
+    return VK_SUCCESS;
+}
+
+static void h_create_buffer(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id)) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    PFN_vkCreateBuffer fn =
+        (PFN_vkCreateBuffer)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id), "vkCreateBuffer");
+    if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+
+    VkBufferCreateInfo info;
+    memset(&info, 0, sizeof(info));
+    vkfw_chain chain;
+    memset(&chain, 0, sizeof(chain));
+    VkResult r = vkfw_buffer_create_info(req, &info, &chain);
+    if (r != VK_SUCCESS) { vkfw_buf_put_result(req->out, r); return; }
+    vkfw_chain_parse(&req->in, &chain);
+    info.pNext = vkfw_chain_head(&chain);
+
+    VkBuffer buffer = VK_NULL_HANDLE;
+    r = fn(device, &info, NULL, &buffer);
+    free((void *)info.pQueueFamilyIndices);
+    vkfw_chain_release(&chain);
+    info.pNext = NULL;
+    if (r != VK_SUCCESS || !buffer) {
+        vkfw_buf_put_result(req->out, r != VK_SUCCESS ? r : VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        return;
+    }
+
+    uint64_t id = vkfw_handle_add(&req->conn->handles, VKFW_OBJ_BUFFER, buffer, dev_id);
+    if (id == 0) {
+        PFN_vkDestroyBuffer destroy =
+            (PFN_vkDestroyBuffer)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id),
+                                                   "vkDestroyBuffer");
+        if (destroy) destroy(device, buffer, NULL);
+        vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY);
+        return;
+    }
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+    vkfw_buf_put_u64(req->out, id);
+}
+
+static void h_destroy_buffer(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t id = 0;
+    if (!vkfw_cur_u64(&req->in, &id)) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+    if (id == 0 || id > req->conn->handles.count) {
+        vkfw_buf_put_result(req->out, VK_SUCCESS);
+        return;
+    }
+    VkBuffer buffer = (VkBuffer)vkfw_handle_get(&req->conn->handles, id, VKFW_OBJ_BUFFER);
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles,
+                                                req->conn->handles.v[id - 1].owner, VKFW_OBJ_DEVICE);
+    if (device && buffer) {
+        PFN_vkDestroyBuffer fn =
+            (PFN_vkDestroyBuffer)vkfw_instance_proc(vkfw_instance_of(req->conn, id), "vkDestroyBuffer");
+        if (fn) fn(device, buffer, NULL);
+    }
+    vkfw_handle_drop(&req->conn->handles, id);
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+}
+
+static void h_get_buffer_memory_requirements(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0, buf_id = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u64(&req->in, &buf_id)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    VkBuffer buffer = (VkBuffer)vkfw_handle_get(&req->conn->handles, buf_id, VKFW_OBJ_BUFFER);
+    PFN_vkGetBufferMemoryRequirements fn = (PFN_vkGetBufferMemoryRequirements)vkfw_instance_proc(
+        vkfw_instance_of(req->conn, buf_id), "vkGetBufferMemoryRequirements");
+    if (!device || !buffer || !fn) {
+        vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    VkMemoryRequirements needs;
+    memset(&needs, 0, sizeof(needs));
+    fn(device, buffer, &needs);
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+    vkfw_buf_put(req->out, &needs, sizeof(needs));
+}
+
+/* ---- binding memory ----------------------------------------------------- */
+
+/*
+ * Binding takes a memory handle, a range inside it and the object to bind, and
+ * that is all it takes: the offset counts from the start of the allocation the
+ * server made, which is the same allocation on both sides, so nothing has to be
+ * translated. It is also the last step that can fail in a way the caller cannot
+ * see coming, so the driver's answer goes back verbatim.
+ */
+static void h_bind_buffer_memory(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0, buf_id = 0, mem_id = 0;
+    uint64_t offset = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u64(&req->in, &buf_id) ||
+        !vkfw_cur_u64(&req->in, &mem_id) || !vkfw_cur_u64(&req->in, &offset)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    VkBuffer buffer = (VkBuffer)vkfw_handle_get(&req->conn->handles, buf_id, VKFW_OBJ_BUFFER);
+    VkDeviceMemory memory =
+        (VkDeviceMemory)vkfw_handle_get(&req->conn->handles, mem_id, VKFW_OBJ_DEVICE_MEMORY);
+    PFN_vkBindBufferMemory fn = (PFN_vkBindBufferMemory)vkfw_instance_proc(
+        vkfw_instance_of(req->conn, dev_id), "vkBindBufferMemory");
+    if (!device || !buffer || !memory || !fn) {
+        vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    vkfw_buf_put_result(req->out, fn(device, buffer, memory, (VkDeviceSize)offset));
+}
+
+static void h_bind_image_memory(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0, img_id = 0, mem_id = 0;
+    uint64_t offset = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u64(&req->in, &img_id) ||
+        !vkfw_cur_u64(&req->in, &mem_id) || !vkfw_cur_u64(&req->in, &offset)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    VkImage image = (VkImage)vkfw_handle_get(&req->conn->handles, img_id, VKFW_OBJ_IMAGE);
+    VkDeviceMemory memory =
+        (VkDeviceMemory)vkfw_handle_get(&req->conn->handles, mem_id, VKFW_OBJ_DEVICE_MEMORY);
+    PFN_vkBindImageMemory fn = (PFN_vkBindImageMemory)vkfw_instance_proc(
+        vkfw_instance_of(req->conn, dev_id), "vkBindImageMemory");
+    if (!device || !image || !memory || !fn) {
+        vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    vkfw_buf_put_result(req->out, fn(device, image, memory, (VkDeviceSize)offset));
+}
+
+/* ---- fences and semaphores ---------------------------------------------- */
+
+/*
+ * Synchronisation objects are the first things here with no contents to carry:
+ * a fence is a flag and a semaphore is a counter, both living entirely in the
+ * driver. So these are handle-only - create returns an id, destroy drops one -
+ * and the state queries are answered by the driver each time rather than
+ * cached, because the whole point of them is that they change behind our back.
+ */
+static void h_create_fence(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0;
+    uint32_t flags = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u32(&req->in, &flags)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    PFN_vkCreateFence fn =
+        (PFN_vkCreateFence)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id), "vkCreateFence");
+    if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+
+    VkFenceCreateInfo info = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    info.flags = (VkFenceCreateFlags)flags;
+    VkFence fence = VK_NULL_HANDLE;
+    VkResult r = fn(device, &info, NULL, &fence);
+    if (r != VK_SUCCESS || !fence) {
+        vkfw_buf_put_result(req->out, r != VK_SUCCESS ? r : VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        return;
+    }
+    uint64_t id = vkfw_handle_add(&req->conn->handles, VKFW_OBJ_FENCE, fence, dev_id);
+    if (id == 0) {
+        PFN_vkDestroyFence destroy =
+            (PFN_vkDestroyFence)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id),
+                                                   "vkDestroyFence");
+        if (destroy) destroy(device, fence, NULL);
+        vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY);
+        return;
+    }
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+    vkfw_buf_put_u64(req->out, id);
+}
+
+static void h_destroy_sync(struct vkfw_request *req, void *unused)
+{
+    uint32_t type = (uint32_t)(uintptr_t)unused;
+    uint64_t id = 0;
+    if (!vkfw_cur_u64(&req->in, &id)) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+    if (id == 0 || id > req->conn->handles.count) {
+        vkfw_buf_put_result(req->out, VK_SUCCESS);
+        return;
+    }
+    void *object = vkfw_handle_get(&req->conn->handles, id, type);
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles,
+                                                req->conn->handles.v[id - 1].owner, VKFW_OBJ_DEVICE);
+    const char *destroy_name = type == VKFW_OBJ_FENCE ? "vkDestroyFence" : "vkDestroySemaphore";
+    if (device && object) {
+        if (type == VKFW_OBJ_FENCE) {
+            PFN_vkDestroyFence fn =
+                (PFN_vkDestroyFence)vkfw_instance_proc(vkfw_instance_of(req->conn, id), destroy_name);
+            if (fn) fn(device, (VkFence)object, NULL);
+        } else {
+            PFN_vkDestroySemaphore fn = (PFN_vkDestroySemaphore)vkfw_instance_proc(
+                vkfw_instance_of(req->conn, id), destroy_name);
+            if (fn) fn(device, (VkSemaphore)object, NULL);
+        }
+    }
+    vkfw_handle_drop(&req->conn->handles, id);
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+}
+
+static void h_reset_fences(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0;
+    uint32_t count = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u32(&req->in, &count)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    if (count > 64) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    PFN_vkResetFences fn =
+        (PFN_vkResetFences)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id), "vkResetFences");
+    if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+
+    VkFence fences[64];
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t id = 0;
+        if (!vkfw_cur_u64(&req->in, &id)) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+        fences[i] = (VkFence)vkfw_handle_get(&req->conn->handles, id, VKFW_OBJ_FENCE);
+        if (!fences[i]) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+    }
+    vkfw_buf_put_result(req->out, fn(device, count, fences));
+}
+
+static void h_get_fence_status(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0, fence_id = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u64(&req->in, &fence_id)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    VkFence fence = (VkFence)vkfw_handle_get(&req->conn->handles, fence_id, VKFW_OBJ_FENCE);
+    PFN_vkGetFenceStatus fn = (PFN_vkGetFenceStatus)vkfw_instance_proc(
+        vkfw_instance_of(req->conn, dev_id), "vkGetFenceStatus");
+    if (!device || !fence || !fn) {
+        vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    vkfw_buf_put_result(req->out, fn(device, fence));
+}
+
+static void h_wait_for_fences(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0, timeout = 0;
+    uint32_t count = 0, wait_all = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u32(&req->in, &count) ||
+        !vkfw_cur_u32(&req->in, &wait_all) || !vkfw_cur_u64(&req->in, &timeout)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    if (count > 64) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    PFN_vkWaitForFences fn = (PFN_vkWaitForFences)vkfw_instance_proc(
+        vkfw_instance_of(req->conn, dev_id), "vkWaitForFences");
+    if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+
+    VkFence fences[64];
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t id = 0;
+        if (!vkfw_cur_u64(&req->in, &id)) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+        fences[i] = (VkFence)vkfw_handle_get(&req->conn->handles, id, VKFW_OBJ_FENCE);
+        if (!fences[i]) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+    }
+    /*
+     * This is the one call here that blocks, and it blocks on the driver's
+     * timeline rather than on anything of ours. A caller asking to wait
+     * forever is asking to be stuck here, which is what it asked for; the
+     * connection is per-client and a stuck client does not hold up the others.
+     */
+    vkfw_buf_put_result(req->out, fn(device, count, fences, wait_all != 0, timeout));
+}
+
+static void h_create_semaphore(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0, initial = 0;
+    uint32_t flags = 0, timeline = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u32(&req->in, &flags) ||
+        !vkfw_cur_u32(&req->in, &timeline) || !vkfw_cur_u64(&req->in, &initial)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    PFN_vkCreateSemaphore fn = (PFN_vkCreateSemaphore)vkfw_instance_proc(
+        vkfw_instance_of(req->conn, dev_id), "vkCreateSemaphore");
+    if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+
+    VkSemaphoreCreateInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    info.flags = (VkSemaphoreCreateFlags)flags;
+    VkSemaphoreTypeCreateInfo type_info = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+    /* A timeline semaphore without its initial value is a binary semaphore
+     * with a confusing name, so the type node rides along when one was asked
+     * for. Either way the driver tells us if it does not want it. */
+    if (timeline) {
+        type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        type_info.initialValue = initial;
+        info.pNext = &type_info;
+    }
+
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    VkResult r = fn(device, &info, NULL, &semaphore);
+    if (r != VK_SUCCESS || !semaphore) {
+        vkfw_buf_put_result(req->out, r != VK_SUCCESS ? r : VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        return;
+    }
+    uint64_t id = vkfw_handle_add(&req->conn->handles, VKFW_OBJ_SEMAPHORE, semaphore, dev_id);
+    if (id == 0) {
+        PFN_vkDestroySemaphore destroy = (PFN_vkDestroySemaphore)vkfw_instance_proc(
+            vkfw_instance_of(req->conn, dev_id), "vkDestroySemaphore");
+        if (destroy) destroy(device, semaphore, NULL);
+        vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY);
+        return;
+    }
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+    vkfw_buf_put_u64(req->out, id);
+}
+
+static void h_get_semaphore_counter_value(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0, sem_id = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u64(&req->in, &sem_id)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    VkSemaphore semaphore =
+        (VkSemaphore)vkfw_handle_get(&req->conn->handles, sem_id, VKFW_OBJ_SEMAPHORE);
+    PFN_vkGetSemaphoreCounterValue fn = (PFN_vkGetSemaphoreCounterValue)vkfw_instance_proc(
+        vkfw_instance_of(req->conn, dev_id), "vkGetSemaphoreCounterValue");
+    if (!device || !semaphore || !fn) {
+        vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    uint64_t value = 0;
+    VkResult r = fn(device, semaphore, &value);
+    vkfw_buf_put_result(req->out, r);
+    if (r == VK_SUCCESS) vkfw_buf_put_u64(req->out, value);
+}
+
+static void h_signal_semaphore(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0, sem_id = 0, value = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u64(&req->in, &sem_id) ||
+        !vkfw_cur_u64(&req->in, &value)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    VkSemaphore semaphore =
+        (VkSemaphore)vkfw_handle_get(&req->conn->handles, sem_id, VKFW_OBJ_SEMAPHORE);
+    PFN_vkSignalSemaphore fn = (PFN_vkSignalSemaphore)vkfw_instance_proc(
+        vkfw_instance_of(req->conn, dev_id), "vkSignalSemaphore");
+    if (!device || !semaphore || !fn) {
+        vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    VkSemaphoreSignalInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
+    info.semaphore = semaphore;
+    info.value = value;
+    vkfw_buf_put_result(req->out, fn(device, &info));
+}
+
+static void h_wait_semaphores(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0, timeout = 0;
+    uint32_t count = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u32(&req->in, &count) ||
+        !vkfw_cur_u64(&req->in, &timeout)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    if (count > 64) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    PFN_vkWaitSemaphores fn = (PFN_vkWaitSemaphores)vkfw_instance_proc(
+        vkfw_instance_of(req->conn, dev_id), "vkWaitSemaphores");
+    if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+
+    VkSemaphore semaphores[64];
+    uint64_t values[64];
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t id = 0, value = 0;
+        if (!vkfw_cur_u64(&req->in, &id) || !vkfw_cur_u64(&req->in, &value)) {
+            vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+            return;
+        }
+        semaphores[i] = (VkSemaphore)vkfw_handle_get(&req->conn->handles, id, VKFW_OBJ_SEMAPHORE);
+        values[i] = value;
+        if (!semaphores[i]) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
+    }
+    VkSemaphoreWaitInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+    info.semaphoreCount = count;
+    info.pSemaphores = semaphores;
+    info.pValues = values;
+    vkfw_buf_put_result(req->out, fn(device, &info, timeout));
+}
+
 /* ---- dispatch ----------------------------------------------------------- */
 
 struct vkfw_entry {
@@ -1588,6 +2043,23 @@ static const struct vkfw_entry kDispatch[] = {
 
     { VKFW_CMD_ALLOCATE_MEMORY, h_allocate_memory, NULL },
     { VKFW_CMD_FREE_MEMORY, h_free_memory, NULL },
+
+    { VKFW_CMD_CREATE_BUFFER, h_create_buffer, NULL },
+    { VKFW_CMD_DESTROY_BUFFER, h_destroy_buffer, NULL },
+    { VKFW_CMD_GET_BUFFER_MEMORY_REQUIREMENTS, h_get_buffer_memory_requirements, NULL },
+    { VKFW_CMD_BIND_BUFFER_MEMORY, h_bind_buffer_memory, NULL },
+    { VKFW_CMD_BIND_IMAGE_MEMORY, h_bind_image_memory, NULL },
+
+    { VKFW_CMD_CREATE_FENCE, h_create_fence, NULL },
+    { VKFW_CMD_DESTROY_FENCE, h_destroy_sync, (void *)(uintptr_t)VKFW_OBJ_FENCE },
+    { VKFW_CMD_RESET_FENCES, h_reset_fences, NULL },
+    { VKFW_CMD_GET_FENCE_STATUS, h_get_fence_status, NULL },
+    { VKFW_CMD_WAIT_FOR_FENCES, h_wait_for_fences, NULL },
+    { VKFW_CMD_CREATE_SEMAPHORE, h_create_semaphore, NULL },
+    { VKFW_CMD_DESTROY_SEMAPHORE, h_destroy_sync, (void *)(uintptr_t)VKFW_OBJ_SEMAPHORE },
+    { VKFW_CMD_GET_SEMAPHORE_COUNTER_VALUE, h_get_semaphore_counter_value, NULL },
+    { VKFW_CMD_SIGNAL_SEMAPHORE, h_signal_semaphore, NULL },
+    { VKFW_CMD_WAIT_SEMAPHORES, h_wait_semaphores, NULL },
 };
 
 void vkfw_serve_connection(int fd)

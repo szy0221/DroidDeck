@@ -42,6 +42,9 @@ enum {
     VKFW_TYPE_QUEUE,
     VKFW_TYPE_IMAGE,
     VKFW_TYPE_DEVICE_MEMORY,
+    VKFW_TYPE_BUFFER,
+    VKFW_TYPE_FENCE,
+    VKFW_TYPE_SEMAPHORE,
     VKFW_TYPE_SURFACE,
     VKFW_TYPE_SWAPCHAIN,
 };
@@ -1697,6 +1700,435 @@ static VkResult vkfw_vkGetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKH
     return VK_SUCCESS;
 }
 
+/* ---- buffers ------------------------------------------------------------
+ *
+ * A buffer is an image without a layout: nothing about it lives here, so the
+ * handle is an id and the driver owns everything else. Its create info does
+ * carry a pNext chain worth forwarding, though - VkExternalMemoryBufferCreateInfo
+ * is how a caller says the memory behind it must be exportable, and a buffer
+ * meant to be handed to the compositor is exactly that.
+ */
+static VkResult vkfw_vkCreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
+                                    const VkAllocationCallbacks *pAllocator, VkBuffer *pBuffer)
+{
+    (void)pAllocator;
+    if (!pBuffer || !pCreateInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *pBuffer = VK_NULL_HANDLE;
+    struct vkfw_device *dev = vkfw_as_device(device);
+    if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    VkBufferCreateInfo info = *pCreateInfo;
+    info.pNext = NULL;
+    uint32_t qf_count = pCreateInfo->pQueueFamilyIndices ? pCreateInfo->queueFamilyIndexCount : 0;
+    info.queueFamilyIndexCount = 0;
+    info.pQueueFamilyIndices = NULL;
+    vkfw_buf_put(&req, &info, sizeof(info));
+    vkfw_buf_put_u32(&req, qf_count);
+    for (uint32_t i = 0; i < qf_count; i++)
+        vkfw_buf_put_u32(&req, pCreateInfo->pQueueFamilyIndices[i]);
+
+    vkfw_chain chain;
+    if (!vkfw_chain_collect(pCreateInfo->pNext, &chain)) {
+        vkfw_buf_free(&req);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    vkfw_chain_put(&req, &chain);
+    vkfw_chain_free(&chain);
+
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_CREATE_BUFFER, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    if (rc != VK_SUCCESS) {
+        vkfw_buf_free(&reply);
+        return vkfw_map_error(rc, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    }
+    uint64_t id = 0;
+    if (!vkfw_cur_u64(&body, &id) || id == 0) {
+        vkfw_buf_free(&reply);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    vkfw_buf_free(&reply);
+
+    struct vkfw_object *obj = calloc(1, sizeof(*obj));
+    if (!obj) {
+        vkfw_buf undo;
+        vkfw_buf_init(&undo);
+        vkfw_buf_put_u64(&undo, id);
+        vkfw_buf confirm;
+        vkfw_invoke(VKFW_CMD_DESTROY_BUFFER, &undo, &confirm);
+        vkfw_buf_free(&undo);
+        vkfw_buf_free(&confirm);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    vkfw_obj_init(obj, VKFW_TYPE_BUFFER, id);
+    *pBuffer = (VkBuffer)obj;
+    return VK_SUCCESS;
+}
+
+static void vkfw_vkDestroyBuffer(VkDevice device, VkBuffer buffer,
+                                 const VkAllocationCallbacks *pAllocator)
+{
+    (void)device;
+    (void)pAllocator;
+    struct vkfw_object *obj = (struct vkfw_object *)buffer;
+    if (!obj || obj->type != VKFW_TYPE_BUFFER) return;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, obj->id);
+    vkfw_buf reply;
+    vkfw_invoke(VKFW_CMD_DESTROY_BUFFER, &req, &reply);
+    vkfw_buf_free(&req);
+    vkfw_buf_free(&reply);
+    free(obj);
+}
+
+static void vkfw_vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer,
+                                               VkMemoryRequirements *pMemoryRequirements)
+{
+    struct vkfw_device *dev = vkfw_as_device(device);
+    struct vkfw_object *obj = (struct vkfw_object *)buffer;
+    if (!pMemoryRequirements || !dev || !obj || obj->type != VKFW_TYPE_BUFFER) return;
+    memset(pMemoryRequirements, 0, sizeof(*pMemoryRequirements));
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    vkfw_buf_put_u64(&req, obj->id);
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_GET_BUFFER_MEMORY_REQUIREMENTS, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    if (rc == VK_SUCCESS) vkfw_cur_bytes(&body, pMemoryRequirements, sizeof(*pMemoryRequirements));
+    vkfw_buf_free(&reply);
+}
+
+/* Binding asks the driver to put an object on a range of an allocation it has
+ * already accepted. Both sides mean the same range, because the allocation is
+ * the same one; the offset is in bytes from its start either way. */
+static VkResult vkfw_bind(VkDevice device, uint64_t object_id, uint64_t memory_id, uint64_t offset,
+                          uint16_t cmd)
+{
+    struct vkfw_device *dev = vkfw_as_device(device);
+    if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    vkfw_buf_put_u64(&req, object_id);
+    vkfw_buf_put_u64(&req, memory_id);
+    vkfw_buf_put_u64(&req, offset);
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(cmd, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    vkfw_buf_free(&reply);
+    return rc == VK_SUCCESS ? VK_SUCCESS : vkfw_map_error(rc, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+}
+
+static VkResult vkfw_vkBindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory,
+                                        VkDeviceSize memoryOffset)
+{
+    struct vkfw_object *obj = (struct vkfw_object *)buffer;
+    struct vkfw_memory *mem = vkfw_as_memory(memory);
+    if (!obj || obj->type != VKFW_TYPE_BUFFER || !mem) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    return vkfw_bind(device, obj->id, mem->base.id, (uint64_t)memoryOffset,
+                     VKFW_CMD_BIND_BUFFER_MEMORY);
+}
+
+static VkResult vkfw_vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory,
+                                       VkDeviceSize memoryOffset)
+{
+    struct vkfw_object *obj = (struct vkfw_object *)image;
+    struct vkfw_memory *mem = vkfw_as_memory(memory);
+    if (!obj || obj->type != VKFW_TYPE_IMAGE || !mem) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    return vkfw_bind(device, obj->id, mem->base.id, (uint64_t)memoryOffset,
+                     VKFW_CMD_BIND_IMAGE_MEMORY);
+}
+
+/* ---- fences and semaphores ---------------------------------------------
+ *
+ * Both are flags the driver keeps: a fence is signalled or it is not, a
+ * semaphore holds a counter. Neither has anything on this side beyond the id,
+ * so the interesting part is not the handle but the waiting, and waiting is
+ * where a forwarding layer can quietly cost a frame. We do not add any: the
+ * call goes straight through and the driver blocks, in the process that owns
+ * the queue. That is also why the wait calls take the timeout the caller gave
+ * rather than a shorter one of ours - the caller is the only one who knows how
+ * long it is prepared to sit here.
+ */
+static VkResult vkfw_make_sync(VkDevice device, uint16_t cmd, const void *create_pnext,
+                               uint64_t extra, uint64_t *id_out)
+{
+    struct vkfw_device *dev = vkfw_as_device(device);
+    if (!dev || !id_out) return VK_ERROR_INITIALIZATION_FAILED;
+    *id_out = 0;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    vkfw_buf_put_u32(&req, (uint32_t)(extra & 0xffffffffu));
+    if (cmd == VKFW_CMD_CREATE_SEMAPHORE) {
+        const VkSemaphoreCreateInfo *si = (const VkSemaphoreCreateInfo *)create_pnext;
+        const VkSemaphoreTypeCreateInfo *ti = NULL;
+        for (const VkBaseInStructure *n = (const VkBaseInStructure *)si->pNext; n;
+             n = n->pNext) {
+            if (n->sType == VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO) {
+                ti = (const VkSemaphoreTypeCreateInfo *)n;
+                break;
+            }
+        }
+        uint32_t timeline = (ti && ti->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE) ? 1u : 0u;
+        vkfw_buf_put_u32(&req, timeline);
+        vkfw_buf_put_u64(&req, timeline ? ti->initialValue : 0);
+    }
+
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(cmd, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    if (rc != VK_SUCCESS) {
+        vkfw_buf_free(&reply);
+        return vkfw_map_error(rc, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    }
+    uint64_t id = 0;
+    if (!vkfw_cur_u64(&body, &id) || id == 0) {
+        vkfw_buf_free(&reply);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    vkfw_buf_free(&reply);
+    *id_out = id;
+    return VK_SUCCESS;
+}
+
+static VkResult vkfw_vkCreateFence(VkDevice device, const VkFenceCreateInfo *pCreateInfo,
+                                   const VkAllocationCallbacks *pAllocator, VkFence *pFence)
+{
+    (void)pAllocator;
+    if (!pFence || !pCreateInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *pFence = VK_NULL_HANDLE;
+
+    uint64_t id = 0;
+    VkResult r = vkfw_make_sync(device, VKFW_CMD_CREATE_FENCE, pCreateInfo, pCreateInfo->flags, &id);
+    if (r != VK_SUCCESS) return r;
+
+    struct vkfw_object *obj = calloc(1, sizeof(*obj));
+    if (!obj) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    vkfw_obj_init(obj, VKFW_TYPE_FENCE, id);
+    *pFence = (VkFence)obj;
+    return VK_SUCCESS;
+}
+
+static VkResult vkfw_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo *pCreateInfo,
+                                       const VkAllocationCallbacks *pAllocator,
+                                       VkSemaphore *pSemaphore)
+{
+    (void)pAllocator;
+    if (!pSemaphore || !pCreateInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *pSemaphore = VK_NULL_HANDLE;
+
+    uint64_t id = 0;
+    VkResult r = vkfw_make_sync(device, VKFW_CMD_CREATE_SEMAPHORE, pCreateInfo,
+                                pCreateInfo->flags, &id);
+    if (r != VK_SUCCESS) return r;
+
+    struct vkfw_object *obj = calloc(1, sizeof(*obj));
+    if (!obj) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    vkfw_obj_init(obj, VKFW_TYPE_SEMAPHORE, id);
+    *pSemaphore = (VkSemaphore)obj;
+    return VK_SUCCESS;
+}
+
+static void vkfw_destroy_sync(VkFence fence, uint32_t want, uint16_t cmd)
+{
+    struct vkfw_object *obj = (struct vkfw_object *)fence;
+    if (!obj || obj->type != want) return;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, obj->id);
+    vkfw_buf reply;
+    vkfw_invoke(cmd, &req, &reply);
+    vkfw_buf_free(&req);
+    vkfw_buf_free(&reply);
+    free(obj);
+}
+
+static void vkfw_vkDestroyFence(VkDevice device, VkFence fence,
+                                const VkAllocationCallbacks *pAllocator)
+{
+    (void)device;
+    (void)pAllocator;
+    vkfw_destroy_sync(fence, VKFW_TYPE_FENCE, VKFW_CMD_DESTROY_FENCE);
+}
+
+static void vkfw_vkDestroySemaphore(VkDevice device, VkSemaphore semaphore,
+                                    const VkAllocationCallbacks *pAllocator)
+{
+    (void)device;
+    (void)pAllocator;
+    vkfw_destroy_sync((VkFence)semaphore, VKFW_TYPE_SEMAPHORE, VKFW_CMD_DESTROY_SEMAPHORE);
+}
+
+/* A list of ids is all a fence array is on the wire; the driver's array is
+ * rebuilt on the other side from handles it already holds. */
+static bool vkfw_put_fences(vkfw_buf *req, const VkFence *fences, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        struct vkfw_object *obj = (struct vkfw_object *)fences[i];
+        if (!obj || obj->type != VKFW_TYPE_FENCE) return false;
+        vkfw_buf_put_u64(req, obj->id);
+    }
+    return true;
+}
+
+static VkResult vkfw_vkResetFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences)
+{
+    struct vkfw_device *dev = vkfw_as_device(device);
+    if (!dev || !pFences || fenceCount == 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (fenceCount > 64) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    vkfw_buf_put_u32(&req, fenceCount);
+    if (!vkfw_put_fences(&req, pFences, fenceCount)) {
+        vkfw_buf_free(&req);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_RESET_FENCES, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    vkfw_buf_free(&reply);
+    return rc == VK_SUCCESS ? VK_SUCCESS : vkfw_map_error(rc, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+}
+
+static VkResult vkfw_vkGetFenceStatus(VkDevice device, VkFence fence)
+{
+    struct vkfw_device *dev = vkfw_as_device(device);
+    struct vkfw_object *obj = (struct vkfw_object *)fence;
+    if (!dev || !obj || obj->type != VKFW_TYPE_FENCE) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    vkfw_buf_put_u64(&req, obj->id);
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_GET_FENCE_STATUS, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    vkfw_buf_free(&reply);
+    /* VK_NOT_READY is a legitimate answer here and means the fence is still
+     * pending, so it must survive the trip rather than be flattened into a
+     * generic failure. */
+    return rc == VK_SUCCESS ? VK_SUCCESS : vkfw_map_error(rc, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+}
+
+static VkResult vkfw_vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences,
+                                     VkBool32 waitAll, uint64_t timeout)
+{
+    struct vkfw_device *dev = vkfw_as_device(device);
+    if (!dev || !pFences || fenceCount == 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (fenceCount > 64) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    vkfw_buf_put_u32(&req, fenceCount);
+    vkfw_buf_put_u32(&req, waitAll ? 1u : 0u);
+    vkfw_buf_put_u64(&req, timeout);
+    if (!vkfw_put_fences(&req, pFences, fenceCount)) {
+        vkfw_buf_free(&req);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_WAIT_FOR_FENCES, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    vkfw_buf_free(&reply);
+    /* VK_TIMEOUT is the answer that says "still pending" here. */
+    return rc == VK_SUCCESS ? VK_SUCCESS : vkfw_map_error(rc, VK_ERROR_DEVICE_LOST);
+}
+
+static VkResult vkfw_vkGetSemaphoreCounterValue(VkDevice device, VkSemaphore semaphore,
+                                                uint64_t *pValue)
+{
+    struct vkfw_device *dev = vkfw_as_device(device);
+    struct vkfw_object *obj = (struct vkfw_object *)semaphore;
+    if (!dev || !obj || obj->type != VKFW_TYPE_SEMAPHORE || !pValue) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    vkfw_buf_put_u64(&req, obj->id);
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_GET_SEMAPHORE_COUNTER_VALUE, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    if (rc == VK_SUCCESS) {
+        uint64_t value = 0;
+        vkfw_cur_u64(&body, &value);
+        *pValue = value;
+    }
+    vkfw_buf_free(&reply);
+    return rc == VK_SUCCESS ? VK_SUCCESS : vkfw_map_error(rc, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+}
+
+static VkResult vkfw_vkSignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
+{
+    struct vkfw_device *dev = vkfw_as_device(device);
+    struct vkfw_object *obj = pSignalInfo ? (struct vkfw_object *)pSignalInfo->semaphore : NULL;
+    if (!dev || !obj || obj->type != VKFW_TYPE_SEMAPHORE) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    vkfw_buf_put_u64(&req, obj->id);
+    vkfw_buf_put_u64(&req, pSignalInfo->value);
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_SIGNAL_SEMAPHORE, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    vkfw_buf_free(&reply);
+    return rc == VK_SUCCESS ? VK_SUCCESS : vkfw_map_error(rc, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+}
+
+static VkResult vkfw_vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo *pWaitInfo,
+                                      uint64_t timeout)
+{
+    struct vkfw_device *dev = vkfw_as_device(device);
+    if (!dev || !pWaitInfo || !pWaitInfo->pSemaphores || pWaitInfo->semaphoreCount == 0)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (pWaitInfo->semaphoreCount > 64) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    vkfw_buf_put_u32(&req, pWaitInfo->semaphoreCount);
+    vkfw_buf_put_u64(&req, timeout);
+    for (uint32_t i = 0; i < pWaitInfo->semaphoreCount; i++) {
+        struct vkfw_object *obj = (struct vkfw_object *)pWaitInfo->pSemaphores[i];
+        uint64_t value = pWaitInfo->pValues ? pWaitInfo->pValues[i] : 0;
+        if (!obj || obj->type != VKFW_TYPE_SEMAPHORE) {
+            vkfw_buf_free(&req);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        vkfw_buf_put_u64(&req, obj->id);
+        vkfw_buf_put_u64(&req, value);
+    }
+    vkfw_buf reply;
+    vkfw_cur body;
+    int32_t rc = vkfw_invoke_status(VKFW_CMD_WAIT_SEMAPHORES, &req, &reply, &body);
+    vkfw_buf_free(&req);
+    vkfw_buf_free(&reply);
+    return rc == VK_SUCCESS ? VK_SUCCESS : vkfw_map_error(rc, VK_ERROR_DEVICE_LOST);
+}
+
 /* ---- window system integration -----------------------------------------
  *
  * The driver on the other side of the socket is an Android driver. It knows
@@ -2101,6 +2533,21 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetDeviceProcAddr(VkDevic
     ENTRY(vkMapMemory);
     ENTRY(vkUnmapMemory);
     ENTRY(vkGetMemoryFdKHR);
+    ENTRY(vkCreateBuffer);
+    ENTRY(vkDestroyBuffer);
+    ENTRY(vkGetBufferMemoryRequirements);
+    ENTRY(vkBindBufferMemory);
+    ENTRY(vkBindImageMemory);
+    ENTRY(vkCreateFence);
+    ENTRY(vkDestroyFence);
+    ENTRY(vkResetFences);
+    ENTRY(vkGetFenceStatus);
+    ENTRY(vkWaitForFences);
+    ENTRY(vkCreateSemaphore);
+    ENTRY(vkDestroySemaphore);
+    ENTRY(vkGetSemaphoreCounterValue);
+    ENTRY(vkSignalSemaphore);
+    ENTRY(vkWaitSemaphores);
     ENTRY(vkCreateSwapchainKHR);
     ENTRY(vkDestroySwapchainKHR);
     ENTRY(vkGetSwapchainImagesKHR);

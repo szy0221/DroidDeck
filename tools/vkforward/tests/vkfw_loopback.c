@@ -213,6 +213,161 @@ static int memory_round_trip(PFN_vkGetInstanceProcAddr gipa, VkDevice device)
     return failures;
 }
 
+/*
+ * A buffer bound to memory, and the two things that say when work on it is
+ * finished.
+ *
+ * Binding is the point where an object stops being an id and becomes something
+ * with storage behind it, and it is the first call here whose failure is silent
+ * in normal use: an unbound buffer only misbehaves when it is used. So the test
+ * binds and checks the answer rather than assuming it.
+ *
+ * The fence half is deliberately modest. A fence with nothing submitted is
+ * unsignalled, and vkGetFenceStatus must say so rather than report success,
+ * because a layer that answers "signalled" to everything would let every caller
+ * read a frame that has not been drawn yet.
+ */
+static int resource_round_trip(PFN_vkGetInstanceProcAddr gipa, VkDevice device)
+{
+    PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)gipa(NULL, "vkGetDeviceProcAddr");
+    if (!gdpa) {
+        printf("[resources] entry points: missing\n");
+        return 1;
+    }
+    PFN_vkCreateBuffer create_buffer = (PFN_vkCreateBuffer)gdpa(device, "vkCreateBuffer");
+    PFN_vkDestroyBuffer destroy_buffer = (PFN_vkDestroyBuffer)gdpa(device, "vkDestroyBuffer");
+    PFN_vkGetBufferMemoryRequirements buffer_needs =
+        (PFN_vkGetBufferMemoryRequirements)gdpa(device, "vkGetBufferMemoryRequirements");
+    PFN_vkBindBufferMemory bind_buffer = (PFN_vkBindBufferMemory)gdpa(device, "vkBindBufferMemory");
+    PFN_vkAllocateMemory alloc_memory = (PFN_vkAllocateMemory)gdpa(device, "vkAllocateMemory");
+    PFN_vkFreeMemory free_memory = (PFN_vkFreeMemory)gdpa(device, "vkFreeMemory");
+    PFN_vkCreateFence create_fence = (PFN_vkCreateFence)gdpa(device, "vkCreateFence");
+    PFN_vkDestroyFence destroy_fence = (PFN_vkDestroyFence)gdpa(device, "vkDestroyFence");
+    PFN_vkGetFenceStatus fence_status = (PFN_vkGetFenceStatus)gdpa(device, "vkGetFenceStatus");
+    PFN_vkResetFences reset_fences = (PFN_vkResetFences)gdpa(device, "vkResetFences");
+    PFN_vkWaitForFences wait_fences = (PFN_vkWaitForFences)gdpa(device, "vkWaitForFences");
+    PFN_vkCreateSemaphore create_sem = (PFN_vkCreateSemaphore)gdpa(device, "vkCreateSemaphore");
+    PFN_vkDestroySemaphore destroy_sem = (PFN_vkDestroySemaphore)gdpa(device, "vkDestroySemaphore");
+    PFN_vkSignalSemaphore signal_sem = (PFN_vkSignalSemaphore)gdpa(device, "vkSignalSemaphore");
+    PFN_vkGetSemaphoreCounterValue get_counter =
+        (PFN_vkGetSemaphoreCounterValue)gdpa(device, "vkGetSemaphoreCounterValue");
+    if (!create_buffer || !destroy_buffer || !buffer_needs || !bind_buffer || !alloc_memory ||
+        !free_memory || !create_fence || !destroy_fence || !fence_status || !reset_fences ||
+        !wait_fences || !create_sem || !destroy_sem || !signal_sem || !get_counter) {
+        printf("[resources] entry points: missing\n");
+        return 1;
+    }
+
+    int failures = 0;
+    const uint64_t bytes = 4096;
+
+    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkResult r = create_buffer(device, &bci, NULL, &buffer);
+    printf("[resources] vkCreateBuffer %llu bytes: %d\n", (unsigned long long)bytes, r);
+    if (r != VK_SUCCESS || !buffer) return 1;
+
+    VkMemoryRequirements needs;
+    memset(&needs, 0, sizeof(needs));
+    buffer_needs(device, buffer, &needs);
+    printf("[resources] buffer memory: size=%llu alignment=%llu types=0x%x\n",
+           (unsigned long long)needs.size, (unsigned long long)needs.alignment, needs.memoryTypeBits);
+    if (needs.size == 0 || needs.alignment == 0 || needs.memoryTypeBits == 0) failures++;
+
+    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    ai.allocationSize = needs.size ? needs.size : bytes;
+    ai.memoryTypeIndex = 0;
+    VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
+    r = alloc_memory(device, &ai, NULL, &buffer_memory);
+    printf("[resources] vkAllocateMemory for it: %d\n", r);
+    if (r != VK_SUCCESS || !buffer_memory) {
+        destroy_buffer(device, buffer, NULL);
+        return 1;
+    }
+
+    r = bind_buffer(device, buffer, buffer_memory, 0);
+    printf("[resources] vkBindBufferMemory: %d\n", r);
+    if (r != VK_SUCCESS) failures++;
+
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence = VK_NULL_HANDLE;
+    r = create_fence(device, &fci, NULL, &fence);
+    printf("[resources] vkCreateFence: %d\n", r);
+    if (r != VK_SUCCESS || !fence) {
+        failures++;
+    } else {
+        VkResult status = fence_status(device, fence);
+        printf("[resources] fence with nothing submitted: %d (%s)\n", status,
+               status == VK_NOT_READY ? "still pending, correct" : "not VK_NOT_READY");
+        /* Anything other than "not ready" means either the fence has been
+         * signalled, which nothing here did, or the answer was lost in
+         * transit and replaced with a generic failure. */
+        if (status != VK_NOT_READY) failures++;
+
+        /* Zero timeout: we are asking whether it is done now, not waiting. */
+        VkResult waited = wait_fences(device, 1, &fence, VK_TRUE, 0);
+        printf("[resources] vkWaitForFences(0): %d (%s)\n", waited,
+               waited == VK_TIMEOUT ? "timed out, correct" : "unexpected");
+        if (waited != VK_TIMEOUT) failures++;
+
+        r = reset_fences(device, 1, &fence);
+        printf("[resources] vkResetFences: %d\n", r);
+        if (r != VK_SUCCESS) failures++;
+
+        destroy_fence(device, fence, NULL);
+    }
+
+    VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    VkSemaphoreTypeCreateInfo sti = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+    sti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    sti.initialValue = 7;
+    sci.pNext = &sti;
+
+    VkSemaphore timeline = VK_NULL_HANDLE;
+    r = create_sem(device, &sci, NULL, &timeline);
+    printf("[resources] vkCreateSemaphore (timeline, 7): %d\n", r);
+    if (r != VK_SUCCESS || !timeline) {
+        /* A driver without timeline semaphores is allowed to say no; it is
+         * not allowed to be handed one and quietly behave as a binary. */
+        printf("[resources]   no timeline semaphore here: skipping the counter check\n");
+    } else {
+        uint64_t value = 0;
+        r = get_counter(device, timeline, &value);
+        printf("[resources] counter: %llu\n", (unsigned long long)value);
+        if (r != VK_SUCCESS || value != 7) failures++;
+
+        VkSemaphoreSignalInfo ssi = { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
+        ssi.semaphore = timeline;
+        ssi.value = 9;
+        r = signal_sem(device, &ssi);
+        printf("[resources] vkSignalSemaphore(9): %d\n", r);
+        if (r == VK_SUCCESS) {
+            uint64_t after = 0;
+            if (get_counter(device, timeline, &after) == VK_SUCCESS && after < 9) {
+                printf("[resources] counter went backwards: %llu\n", (unsigned long long)after);
+                failures++;
+            }
+        }
+        destroy_sem(device, timeline, NULL);
+    }
+
+    VkSemaphoreCreateInfo bsci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    VkSemaphore binary = VK_NULL_HANDLE;
+    r = create_sem(device, &bsci, NULL, &binary);
+    printf("[resources] vkCreateSemaphore (binary): %d\n", r);
+    if (r != VK_SUCCESS || !binary) failures++;
+    else destroy_sem(device, binary, NULL);
+
+    free_memory(device, buffer_memory, NULL);
+    destroy_buffer(device, buffer, NULL);
+    printf("[resources] done\n");
+    return failures;
+}
+
 /* Phase 2 does what a real Vulkan tool does: enables every reported extension
  * and walks the long pNext chains (the VkPhysicalDeviceVulkan1x* structs) that
  * vulkaninfo relies on. Anything wrong in the chain marshalling shows up here,
@@ -776,6 +931,7 @@ int main(int argc, char **argv)
             failures += image_round_trip(gipa, device);
             printf("\n[memory] device memory across the socket\n");
             failures += memory_round_trip(gipa, device);
+            failures += resource_round_trip(gipa, device);
             PFN_vkDestroyDevice destroy_dev = (PFN_vkDestroyDevice)gipa(instance, "vkDestroyDevice");
             if (destroy_dev) destroy_dev(device, NULL);
         }
