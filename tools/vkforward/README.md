@@ -152,9 +152,17 @@ on every change.
 
 ## Known gaps (to close in M2/M3)
 
-- No rendering commands yet: buffers, image views, command buffers and queue
-  submission reply `VK_ERROR_FEATURE_NOT_PRESENT`. **Device memory is
-  forwarded** — see the next point.
+- **A resource can now be made and backed by memory.** Buffers, images,
+  device memory, binding either of them to it, fences and binary and timeline
+  semaphores all cross the socket. Buffer create info forwards its pNext chain,
+  because `VkExternalMemoryBufferCreateInfo` lives there and it is the only way
+  a caller says the allocation behind a buffer has to be exportable.
+  Not forwarded yet: image views, framebuffers, render passes, pipelines,
+  descriptors, command buffers and queue submission.
+- A command the driver does not have — one from a Vulkan newer than the device
+  was built for, say — is reported as `VK_ERROR_FEATURE_NOT_PRESENT`, not as a
+  failure. "This device cannot" and "the layer is broken" are different
+  answers and only one of them is the caller's problem.
 - Core commands that are not implemented answer with a stub that returns that
   error rather than with NULL. The loader builds a trampoline for every core
   command whatever the ICD behind it can do, and the trampoline dispatches
@@ -183,8 +191,8 @@ on every change.
   list lives once, in `vkfw_protocol.h`, and both halves use it.
   Surfaces, support queries, formats and modes are complete; **presenting is
   not**: `vkCreateSwapchainKHR` and friends answer `VK_ERROR_FEATURE_NOT_PRESENT`
-  and say so on stderr, because real swapchain images need the memory, binding
-  and submit commands that do not exist yet.
+  and say so on stderr, because real swapchain images need the command buffers
+  and queue submission that do not exist yet.
 - No Vulkan layers in this ICD.
 - The loader resolves promoted `...2KHR` aliases only while their extension is
   enabled; without it the ICD sees the core spellings, which is what it serves.
