@@ -29,6 +29,10 @@ void vkfw_client_reset(void);           /* drop the cached connection */
  * VKFW_ERR_TRANSPORT when the peer is unreachable and VKFW_ERR_PROTOCOL on a
  * malformed frame. The sequence counter is handled here. */
 int vkfw_transact(uint16_t cmd, const void *payload, size_t payload_len, vkfw_buf *out);
+/* Same, for replies that carry a descriptor: *recvfd is set to -1 when the
+ * reply had none, and the caller owns whatever it is set to. */
+int vkfw_transact_fd(uint16_t cmd, const void *payload, size_t payload_len, vkfw_buf *out,
+                     int *recvfd);
 
 /* Convenience: result code and body of a reply payload. */
 int32_t vkfw_reply_result(const vkfw_buf *b);
@@ -43,6 +47,12 @@ int vkfw_listen(const char *endpoint);
  * server/vkfw_server_core.c. */
 bool vkfw_read_frame(int fd, struct vkfw_header *hdr, vkfw_buf *payload);
 bool vkfw_write_frame(int fd, uint16_t cmd, uint64_t seq, const void *payload, size_t len);
+
+/* Descriptor-carrying variants. passfd is sent with the header (-1 for none);
+ * *recvfd picks up one descriptor from the header (-1 when there was none). */
+bool vkfw_read_frame_fd(int fd, struct vkfw_header *hdr, vkfw_buf *payload, int *recvfd);
+bool vkfw_write_frame_fd(int fd, uint16_t cmd, uint64_t seq, const void *payload, size_t len,
+                         int passfd);
 
 #ifdef __cplusplus
 }

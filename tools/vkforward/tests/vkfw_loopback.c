@@ -111,6 +111,79 @@ static int image_round_trip(PFN_vkGetInstanceProcAddr gipa, VkDevice device)
     return failures;
 }
 
+/*
+ * Memory is the first thing that has to cross the socket as more than an id.
+ *
+ * The caller is handed a pointer it writes through and a descriptor it hands
+ * to a compositor, and both have to be real: a mapping the driver cannot see
+ * is worse than none, because the data simply goes nowhere, and a descriptor
+ * that is not a dma-buf gets refused by the thing that was going to import it.
+ * Writing a pattern and reading it back proves the first; asking how big the
+ * descriptor is proves the second is at least a file the right size.
+ */
+static int memory_round_trip(PFN_vkGetInstanceProcAddr gipa, VkDevice device)
+{
+    PFN_vkAllocateMemory alloc_memory = (PFN_vkAllocateMemory)gipa(NULL, "vkAllocateMemory");
+    PFN_vkFreeMemory free_memory = (PFN_vkFreeMemory)gipa(NULL, "vkFreeMemory");
+    PFN_vkMapMemory map_memory = (PFN_vkMapMemory)gipa(NULL, "vkMapMemory");
+    PFN_vkUnmapMemory unmap_memory = (PFN_vkUnmapMemory)gipa(NULL, "vkUnmapMemory");
+    PFN_vkGetMemoryFdKHR get_memory_fd = (PFN_vkGetMemoryFdKHR)gipa(NULL, "vkGetMemoryFdKHR");
+    if (!alloc_memory || !free_memory || !map_memory || !unmap_memory || !get_memory_fd) {
+        printf("[memory] entry points: missing\n");
+        return 1;
+    }
+
+    int failures = 0;
+    const uint64_t bytes = 65536;
+
+    VkExportMemoryAllocateInfo export_info = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
+    export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    ai.pNext = &export_info;
+    ai.allocationSize = bytes;
+    ai.memoryTypeIndex = 0;
+
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkResult r = alloc_memory(device, &ai, NULL, &memory);
+    printf("[memory] vkAllocateMemory %llu bytes, exportable: %d\n", (unsigned long long)bytes, r);
+    if (r != VK_SUCCESS || !memory) return 1;
+
+    void *at = NULL;
+    r = map_memory(device, memory, 0, 4096, 0, &at);
+    printf("[memory] vkMapMemory: %d (%s)\n", r, at ? "mapped" : "no pointer");
+    if (r != VK_SUCCESS || !at) {
+        failures++;
+    } else {
+        unsigned char *p = (unsigned char *)at;
+        for (int i = 0; i < 256; i++) p[i] = (unsigned char)(i * 7 + 1);
+        int bad = 0;
+        for (int i = 0; i < 256; i++)
+            if (p[i] != (unsigned char)(i * 7 + 1)) bad++;
+        printf("[memory] write then read back: %s\n", bad == 0 ? "matches" : "DOES NOT MATCH");
+        if (bad) failures++;
+        unmap_memory(device, memory);
+    }
+
+    int fd = -1;
+    VkMemoryGetFdInfoKHR gi = { VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
+    gi.memory = memory;
+    gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    r = get_memory_fd(device, &gi, &fd);
+    printf("[memory] vkGetMemoryFdKHR: %d (fd %d)\n", r, fd);
+    if (r != VK_SUCCESS || fd < 0) {
+        failures++;
+    } else {
+        off_t size = lseek(fd, 0, SEEK_END);
+        printf("[memory] the descriptor is %ld bytes\n", (long)size);
+        if (size < (off_t)bytes) failures++;
+        close(fd);
+    }
+
+    free_memory(device, memory, NULL);
+    printf("[memory] done\n");
+    return failures;
+}
+
 /* Phase 2 does what a real Vulkan tool does: enables every reported extension
  * and walks the long pNext chains (the VkPhysicalDeviceVulkan1x* structs) that
  * vulkaninfo relies on. Anything wrong in the chain marshalling shows up here,
@@ -672,6 +745,8 @@ int main(int argc, char **argv)
             printf("vkGetDeviceQueue: %s\n", queue ? "OK" : "FAILED");
             if (!queue) failures++;
             failures += image_round_trip(gipa, device);
+            printf("\n[memory] device memory across the socket\n");
+            failures += memory_round_trip(gipa, device);
             PFN_vkDestroyDevice destroy_dev = (PFN_vkDestroyDevice)gipa(instance, "vkDestroyDevice");
             if (destroy_dev) destroy_dev(device, NULL);
         }

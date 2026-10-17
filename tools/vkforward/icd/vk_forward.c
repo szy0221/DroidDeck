@@ -15,6 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define VK_NO_PROTOTYPES 1
 #include <vulkan/vulkan.h>
@@ -38,6 +41,7 @@ enum {
     VKFW_TYPE_DEVICE,
     VKFW_TYPE_QUEUE,
     VKFW_TYPE_IMAGE,
+    VKFW_TYPE_DEVICE_MEMORY,
     VKFW_TYPE_SURFACE,
     VKFW_TYPE_SWAPCHAIN,
 };
@@ -147,6 +151,13 @@ static int vkfw_invoke(uint16_t cmd, vkfw_buf *payload, vkfw_buf *reply)
 {
     if (payload->len > VKFW_MAX_PAYLOAD) return VKFW_ERR_PROTOCOL;
     return vkfw_transact(cmd, payload->data, payload->len, reply);
+}
+
+/* Same, for replies that carry a descriptor: *fd_out is -1 when none came. */
+static int vkfw_invoke_fd(uint16_t cmd, vkfw_buf *payload, vkfw_buf *reply, int *fd_out)
+{
+    if (payload->len > VKFW_MAX_PAYLOAD) return VKFW_ERR_PROTOCOL;
+    return vkfw_transact_fd(cmd, payload->data, payload->len, reply, fd_out);
 }
 
 static int32_t vkfw_invoke_status(uint16_t cmd, vkfw_buf *payload, vkfw_buf *reply, vkfw_cur *body)
@@ -1133,6 +1144,49 @@ static void vkfw_vkGetPhysicalDeviceExternalSemaphoreProperties(
  * tablet. There is no shell and no vulkaninfo in the runtime image, so a line
  * in the session log is the only way to find out.
  */
+static bool vkfw_phys_has_device_extension(VkPhysicalDevice pd, const char *name)
+{
+    uint32_t count = 0;
+    if (vkfw_vkEnumerateDeviceExtensionProperties(pd, NULL, &count, NULL) != VK_SUCCESS || count == 0)
+        return false;
+    VkExtensionProperties *props = calloc(count, sizeof(*props));
+    if (!props) return false;
+    uint32_t got = count;
+    bool have = false;
+    if (vkfw_vkEnumerateDeviceExtensionProperties(pd, NULL, &got, props) == VK_SUCCESS) {
+        for (uint32_t i = 0; i < got; i++) {
+            if (strcmp(props[i].extensionName, name) == 0) {
+                have = true;
+                break;
+            }
+        }
+    }
+    free(props);
+    return have;
+}
+
+/*
+ * Extensions the forwarding layer itself needs, whether or not the caller
+ * asked for them.
+ *
+ * Everything we allocate goes through a dma-buf so the caller can map it here
+ * and a compositor can import it there, and a driver will not accept an import
+ * unless the extension behind it is enabled on the device. A caller that wants
+ * exported memory asks for it already; one that does not would otherwise be
+ * handed memory it cannot map, for no reason it can see.
+ */
+static const char *const kNeededDeviceExtensions[] = {
+    "VK_KHR_external_memory_fd",
+    "VK_EXT_external_memory_dma_buf",
+};
+
+static bool vkfw_name_listed(const char *const *names, uint32_t count, const char *name)
+{
+    for (uint32_t i = 0; i < count; i++)
+        if (names[i] && strcmp(names[i], name) == 0) return true;
+    return false;
+}
+
 static void vkfw_log_driver_capabilities(VkPhysicalDevice pd)
 {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1221,9 +1275,21 @@ static VkResult vkfw_vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInf
     vkfw_buf_put_u32(&req, info->enabledLayerCount);
     for (uint32_t i = 0; i < info->enabledLayerCount; i++)
         vkfw_buf_put_str(&req, info->ppEnabledLayerNames[i]);
-    vkfw_buf_put_u32(&req, info->enabledExtensionCount);
+    const char *extra[sizeof(kNeededDeviceExtensions) / sizeof(kNeededDeviceExtensions[0])];
+    uint32_t extra_count = 0;
+    for (uint32_t i = 0; i < sizeof(kNeededDeviceExtensions) / sizeof(kNeededDeviceExtensions[0]); i++) {
+        const char *name = kNeededDeviceExtensions[i];
+        if (vkfw_name_listed(info->ppEnabledExtensionNames, info->enabledExtensionCount, name))
+            continue;
+        if (!vkfw_phys_has_device_extension(pd, name)) continue;
+        extra[extra_count++] = name;
+        fprintf(stderr, "[vkforward] enabling %s on the device: this layer needs it\n", name);
+    }
+
+    vkfw_buf_put_u32(&req, info->enabledExtensionCount + extra_count);
     for (uint32_t i = 0; i < info->enabledExtensionCount; i++)
         vkfw_buf_put_str(&req, info->ppEnabledExtensionNames[i]);
+    for (uint32_t i = 0; i < extra_count; i++) vkfw_buf_put_str(&req, extra[i]);
 
     vkfw_buf reply;
     vkfw_cur body;
@@ -1460,6 +1526,175 @@ static void vkfw_vkGetImageSparseMemoryRequirements(VkDevice device, VkImage ima
     }
     *pSparseMemoryRequirementCount = wrote;
     vkfw_buf_free(&reply);
+}
+
+/* ---- device memory -----------------------------------------------------
+ *
+ * The server allocates the backing store as a memfd, imports it into the
+ * driver as a dma-buf and sends the descriptor back with the reply. Mapping
+ * is therefore local: we mmap our own descriptor and hand out that address,
+ * which is the only way a caller can be given a pointer it can write through
+ * and have the driver see the result.
+ *
+ * It also means a caller can export what it allocated. vkGetMemoryFdKHR dups
+ * the same descriptor, so an image backed by this memory can be handed to a
+ * compositor as a dma-buf - which is what presenting a frame comes down to.
+ */
+struct vkfw_memory {
+    struct vkfw_object base;
+    void *map;      /* our mapping of fd, or NULL */
+    uint64_t size;
+    int fd;         /* -1 when the driver would not take one */
+};
+
+static struct vkfw_memory *vkfw_as_memory(VkDeviceMemory memory)
+{
+    struct vkfw_memory *m = (struct vkfw_memory *)memory;
+    if (!m || m->base.type != VKFW_TYPE_DEVICE_MEMORY) return NULL;
+    return m;
+}
+
+static VkResult vkfw_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+                                      const VkAllocationCallbacks *pAllocator,
+                                      VkDeviceMemory *pMemory)
+{
+    (void)pAllocator;
+    if (!pMemory || !pAllocateInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *pMemory = VK_NULL_HANDLE;
+    struct vkfw_device *dev = vkfw_as_device(device);
+    if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    VkMemoryAllocateInfo info = *pAllocateInfo;
+    info.pNext = NULL;
+    vkfw_buf_put(&req, &info, sizeof(info));
+
+    vkfw_chain chain;
+    if (!vkfw_chain_collect(pAllocateInfo->pNext, &chain)) {
+        vkfw_buf_free(&req);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    vkfw_chain_put(&req, &chain);
+    vkfw_chain_free(&chain);
+
+    vkfw_buf reply;
+    vkfw_cur body;
+    int fd = -1;
+    int rc = vkfw_invoke_fd(VKFW_CMD_ALLOCATE_MEMORY, &req, &reply, &fd);
+    vkfw_buf_free(&req);
+    if (rc != 0) {
+        vkfw_buf_free(&reply);
+        return vkfw_map_error(rc, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    }
+    int32_t result = vkfw_reply_result(&reply);
+    if (result != VK_SUCCESS || !vkfw_reply_body(&reply, &body)) {
+        vkfw_buf_free(&reply);
+        if (fd >= 0) close(fd);
+        return vkfw_map_error(result, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    }
+    uint64_t id = 0, size = 0;
+    vkfw_cur_u64(&body, &id);
+    vkfw_cur_u64(&body, &size);
+
+    struct vkfw_memory *mem = calloc(1, sizeof(*mem));
+    if (!mem) {
+        vkfw_buf_free(&reply);
+        if (fd >= 0) close(fd);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    vkfw_obj_init(&mem->base, VKFW_TYPE_DEVICE_MEMORY, id);
+    mem->size = size;
+    mem->fd = fd;
+    if (fd >= 0 && size > 0) {
+        void *at = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (at == MAP_FAILED) {
+            /* Still usable - only mapping is lost, and the caller finds out
+             * from vkMapMemory, not from here. */
+            fprintf(stderr, "[vkforward] cannot map the memory the driver handed back: %s\n",
+                    strerror(errno));
+        } else {
+            mem->map = at;
+        }
+    }
+    vkfw_buf_free(&reply);
+    *pMemory = (VkDeviceMemory)mem;
+    return VK_SUCCESS;
+}
+
+static void vkfw_vkFreeMemory(VkDevice device, VkDeviceMemory memory,
+                              const VkAllocationCallbacks *pAllocator)
+{
+    (void)pAllocator;
+    struct vkfw_device *dev = vkfw_as_device(device);
+    struct vkfw_memory *mem = vkfw_as_memory(memory);
+    if (!dev || !mem) return;
+
+    vkfw_buf req;
+    vkfw_buf_init(&req);
+    vkfw_buf_put_u64(&req, dev->base.id);
+    vkfw_buf_put_u64(&req, mem->base.id);
+    vkfw_buf reply;
+    vkfw_invoke(VKFW_CMD_FREE_MEMORY, &req, &reply);
+    vkfw_buf_free(&req);
+    vkfw_buf_free(&reply);
+
+    if (mem->map) munmap(mem->map, (size_t)mem->size);
+    if (mem->fd >= 0) close(mem->fd);
+    free(mem);
+}
+
+static VkResult vkfw_vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
+                                 VkDeviceSize size, VkMemoryMapFlags flags, void **ppData)
+{
+    (void)device;
+    (void)flags;
+    if (!ppData) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *ppData = NULL;
+    struct vkfw_memory *mem = vkfw_as_memory(memory);
+    if (!mem) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    if (!mem->map) {
+        fprintf(stderr, "[vkforward] vkMapMemory on memory the driver did not back with a "
+                        "descriptor: nothing here to map\n");
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
+    if (size == VK_WHOLE_SIZE) size = mem->size - offset;
+    if (offset > mem->size || size > mem->size - offset) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    *ppData = (uint8_t *)mem->map + offset;
+    return VK_SUCCESS;
+}
+
+/* The mapping stays for the lifetime of the allocation. Unmapping here would
+ * only mean the next vkMapMemory has nothing to return, and nothing about a
+ * descriptor-backed mapping needs the caller to close it. */
+static void vkfw_vkUnmapMemory(VkDevice device, VkDeviceMemory memory)
+{
+    (void)device;
+    (void)memory;
+}
+
+/* What the caller asked to be able to export. The descriptor is already
+ * ours, so handing one out is a dup: the same memory, an independent fd,
+ * which is what a compositor expects to be given and then close. */
+static VkResult vkfw_vkGetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo,
+                                      int *pFd)
+{
+    (void)device;
+    if (!pFd || !pGetFdInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *pFd = -1;
+    struct vkfw_memory *mem = vkfw_as_memory(pGetFdInfo->memory);
+    if (!mem) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (mem->fd < 0) {
+        fprintf(stderr, "[vkforward] vkGetMemoryFdKHR on memory the driver did not back with a "
+                        "descriptor: it cannot be imported anywhere\n");
+        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+    }
+    int copy = dup(mem->fd);
+    if (copy < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *pFd = copy;
+    return VK_SUCCESS;
 }
 
 /* ---- window system integration -----------------------------------------
@@ -1861,6 +2096,11 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetDeviceProcAddr(VkDevic
     ENTRY(vkDestroyImage);
     ENTRY(vkGetImageMemoryRequirements);
     ENTRY(vkGetImageSparseMemoryRequirements);
+    ENTRY(vkAllocateMemory);
+    ENTRY(vkFreeMemory);
+    ENTRY(vkMapMemory);
+    ENTRY(vkUnmapMemory);
+    ENTRY(vkGetMemoryFdKHR);
     ENTRY(vkCreateSwapchainKHR);
     ENTRY(vkDestroySwapchainKHR);
     ENTRY(vkGetSwapchainImagesKHR);

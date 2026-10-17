@@ -59,7 +59,89 @@ static void vkfw_header_put(uint8_t *dst, const struct vkfw_header *h)
     memcpy(dst + 12, &h->seq, 8);
 }
 
-bool vkfw_write_frame(int fd, uint16_t cmd, uint64_t seq, const void *payload, size_t len)
+/*
+ * Passing a file descriptor alongside a frame.
+ *
+ * A dma-buf is the only thing both halves can name: the driver allocates
+ * memory the client cannot address, and the client needs a handle it can hand
+ * to a compositor or map into its own address space. A descriptor is the one
+ * currency the kernel will carry across for us, so it rides along with the
+ * frame header.
+ *
+ * It is attached to the header rather than the payload because the reader
+ * already reads the header first; anything arriving with the payload would be
+ * trivially lost by a reader that only wanted the length.
+ */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+#define VKFW_MAX_PASSFD 4
+
+static ssize_t vkfw_send_header(int fd, const uint8_t *header, size_t n, int passfd)
+{
+    struct iovec iov;
+    iov.iov_base = (void *)header;
+    iov.iov_len = n;
+
+    char control[CMSG_SPACE(sizeof(int))];
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    if (passfd >= 0) {
+        memset(control, 0, sizeof(control));
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &passfd, sizeof(int));
+    }
+
+    ssize_t sent = sendmsg(fd, &msg, MSG_NOSIGNAL);
+    if (sent < 0 && errno == EINTR) sent = sendmsg(fd, &msg, MSG_NOSIGNAL);
+    return sent;
+}
+
+/* Reads the header, picking up any descriptors riding along with it. Any
+ * beyond the first are closed: a frame carries at most one, and a leaked
+ * descriptor is a leak in whichever process received it. */
+static ssize_t vkfw_recv_header(int fd, uint8_t *header, size_t n, int *recvfd)
+{
+    struct iovec iov;
+    iov.iov_base = header;
+    iov.iov_len = n;
+
+    char control[CMSG_SPACE(VKFW_MAX_PASSFD * sizeof(int))];
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    ssize_t got = recvmsg(fd, &msg, 0);
+    if (got < 0 && errno == EINTR) got = recvmsg(fd, &msg, 0);
+    if (got <= 0) return got;
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    for (; cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) continue;
+        int *fds = (int *)(void *)CMSG_DATA(cmsg);
+        size_t count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        for (size_t i = 0; i < count; i++) {
+            if (recvfd && *recvfd < 0) *recvfd = fds[i];
+            else close(fds[i]);
+        }
+    }
+    return got;
+}
+
+bool vkfw_write_frame_fd(int fd, uint16_t cmd, uint64_t seq, const void *payload, size_t len,
+                         int passfd)
 {
     if (len > VKFW_MAX_PAYLOAD) return false;
     uint8_t header[VKFW_HEADER_SIZE];
@@ -71,16 +153,34 @@ bool vkfw_write_frame(int fd, uint16_t cmd, uint64_t seq, const void *payload, s
         .seq = seq,
     };
     vkfw_header_put(header, &h);
-    if (vkfw_write_all(fd, header, sizeof(header)) < 0) return false;
+
+    if (passfd < 0) {
+        if (vkfw_write_all(fd, header, sizeof(header)) < 0) return false;
+    } else {
+        ssize_t sent = vkfw_send_header(fd, header, sizeof(header), passfd);
+        if (sent < 0) return false;
+        if ((size_t)sent < sizeof(header) &&
+            vkfw_write_all(fd, header + sent, sizeof(header) - (size_t)sent) < 0)
+            return false;
+    }
     if (len && vkfw_write_all(fd, payload, len) < 0) return false;
     return true;
 }
 
-bool vkfw_read_frame(int fd, struct vkfw_header *hdr, vkfw_buf *payload)
+bool vkfw_write_frame(int fd, uint16_t cmd, uint64_t seq, const void *payload, size_t len)
 {
+    return vkfw_write_frame_fd(fd, cmd, seq, payload, len, -1);
+}
+
+bool vkfw_read_frame_fd(int fd, struct vkfw_header *hdr, vkfw_buf *payload, int *recvfd)
+{
+    if (recvfd) *recvfd = -1;
     uint8_t header[VKFW_HEADER_SIZE];
-    ssize_t got = vkfw_read_exact(fd, header, sizeof(header));
+    ssize_t got = vkfw_recv_header(fd, header, sizeof(header), recvfd);
     if (got <= 0) return false;
+    if ((size_t)got < sizeof(header) &&
+        vkfw_read_exact(fd, header + got, sizeof(header) - (size_t)got) <= 0)
+        return false;
 
     memcpy(&hdr->magic, header + 0, 4);
     memcpy(&hdr->cmd, header + 4, 2);
@@ -94,7 +194,19 @@ bool vkfw_read_frame(int fd, struct vkfw_header *hdr, vkfw_buf *payload)
     if (hdr->payload_len == 0) return true;
     void *at = vkfw_buf_extend(payload, hdr->payload_len);
     if (!at) return false;
-    return vkfw_read_exact(fd, at, hdr->payload_len) == (ssize_t)hdr->payload_len;
+    if (vkfw_read_exact(fd, at, hdr->payload_len) != (ssize_t)hdr->payload_len) {
+        if (recvfd && *recvfd >= 0) {
+            close(*recvfd);
+            *recvfd = -1;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool vkfw_read_frame(int fd, struct vkfw_header *hdr, vkfw_buf *payload)
+{
+    return vkfw_read_frame_fd(fd, hdr, payload, NULL);
 }
 
 /* ---- command names and tracing ------------------------------------------ */
@@ -258,7 +370,8 @@ void vkfw_client_reset(void)
     pthread_mutex_unlock(&g_client_lock);
 }
 
-int vkfw_transact(uint16_t cmd, const void *payload, size_t payload_len, vkfw_buf *out)
+int vkfw_transact_fd(uint16_t cmd, const void *payload, size_t payload_len, vkfw_buf *out,
+                     int *recvfd)
 {
     vkfw_buf_clear(out);
     pthread_mutex_lock(&g_client_lock);
@@ -276,7 +389,7 @@ int vkfw_transact(uint16_t cmd, const void *payload, size_t payload_len, vkfw_bu
     vkfw_buf_init(&reply);
 
     if (!vkfw_write_frame(fd, cmd, seq, payload, payload_len)) goto out;
-    if (!vkfw_read_frame(fd, &hdr, &reply)) goto out;
+    if (!vkfw_read_frame_fd(fd, &hdr, &reply, recvfd)) goto out;
     if (hdr.magic != VKFW_MAGIC || hdr.seq != seq || hdr.cmd != cmd) {
         rc = VKFW_ERR_PROTOCOL;
         goto out;
@@ -289,9 +402,18 @@ int vkfw_transact(uint16_t cmd, const void *payload, size_t payload_len, vkfw_bu
 
 out:
     vkfw_trace(cmd, payload_len, rc, rc == 0 ? out : &reply);
+    if (rc != 0 && recvfd && *recvfd >= 0) {
+        close(*recvfd);
+        *recvfd = -1;
+    }
     vkfw_buf_free(&reply);
     pthread_mutex_unlock(&g_client_lock);
     return rc;
+}
+
+int vkfw_transact(uint16_t cmd, const void *payload, size_t payload_len, vkfw_buf *out)
+{
+    return vkfw_transact_fd(cmd, payload, payload_len, out, NULL);
 }
 
 int32_t vkfw_reply_result(const vkfw_buf *b)

@@ -18,10 +18,16 @@
 #include <android/log.h>
 #define VKFW_LOG_TAG "vkforward"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, VKFW_LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, VKFW_LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, VKFW_LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, VKFW_LOG_TAG, __VA_ARGS__)
 #else
 #define LOGI(...)                                                                              \
+    do {                                                                                       \
+        fprintf(stderr, "[vkforward] " __VA_ARGS__);                                           \
+        fputc('\n', stderr);                                                                   \
+    } while (0)
+#define LOGW(...)                                                                              \
     do {                                                                                       \
         fprintf(stderr, "[vkforward] " __VA_ARGS__);                                           \
         fputc('\n', stderr);                                                                   \
@@ -111,6 +117,7 @@ enum vkfw_handle_type {
     VKFW_OBJ_DEVICE,
     VKFW_OBJ_QUEUE,
     VKFW_OBJ_IMAGE,
+    VKFW_OBJ_DEVICE_MEMORY,
 };
 
 struct vkfw_handle_slot {
@@ -135,6 +142,10 @@ struct vkfw_request {
     uint64_t seq;
     vkfw_cur in;
     vkfw_buf *out;
+    /* A descriptor to hand over with the reply, or -1. Set by handlers that
+     * allocate memory the client is meant to map or export; the reply owns it
+     * once vkfw_reply has sent it. */
+    int passfd;
 };
 
 /* Ids are 1-based indexes into the slot array; destroyed slots are reused.
@@ -199,7 +210,11 @@ static VkInstance vkfw_instance_of(struct vkfw_conn *c, uint64_t id)
 
 static void vkfw_reply(struct vkfw_request *req, uint16_t cmd, const vkfw_buf *payload)
 {
-    vkfw_write_frame(req->conn->fd, cmd, req->seq, payload->data, payload->len);
+    vkfw_write_frame_fd(req->conn->fd, cmd, req->seq, payload->data, payload->len, req->passfd);
+    if (req->passfd >= 0) {
+        close(req->passfd);
+        req->passfd = -1;
+    }
 }
 
 /* ---- handlers ----------------------------------------------------------- */
@@ -1214,6 +1229,148 @@ static void h_get_image_sparse_memory_requirements(struct vkfw_request *req, voi
     free(reqs);
 }
 
+/* ---- device memory ------------------------------------------------------ */
+
+/*
+ * Memory the other process can map, and memory a compositor can import.
+ *
+ * A pointer the driver hands out here means nothing over there, so mapping is
+ * the one thing that cannot be forwarded: there is no value to send back.
+ * What does travel is a descriptor. We create the backing store ourselves as
+ * a memfd, import it into the driver as a dma-buf, and hand the same
+ * descriptor to the client - which maps it for vkMapMemory and passes it on
+ * from vkGetMemoryFdKHR to anything that wants to import the image, which is
+ * exactly what a Wayland compositor does with a swapchain image.
+ *
+ * A driver that will not import a dma-buf gets a plain allocation instead.
+ * That memory cannot be mapped or exported from the other side, and the caller
+ * finds that out from vkMapMemory rather than from vkAllocateMemory: refusing
+ * the allocation outright would break every caller that never maps.
+ */
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 1u
+#endif
+
+static int vkfw_make_memfd(uint64_t size)
+{
+#if defined(__NR_memfd_create)
+    int fd = (int)syscall(__NR_memfd_create, "vkforward", MFD_CLOEXEC);
+#else
+    int fd = -1;
+#endif
+    if (fd < 0) return -1;
+    if (ftruncate(fd, (off_t)size) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void h_allocate_memory(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0;
+    VkMemoryAllocateInfo info;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_bytes(&req->in, &info, sizeof(info))) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    info.pNext = NULL;
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    PFN_vkAllocateMemory fn = (PFN_vkAllocateMemory)vkfw_instance_proc(
+        vkfw_instance_of(req->conn, dev_id), "vkAllocateMemory");
+    if (!device || !fn) {
+        vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+
+    vkfw_chain chain;
+    memset(&chain, 0, sizeof(chain));
+    vkfw_chain_parse(&req->in, &chain);
+
+    uint32_t export_types = 0;
+    void *dedicated = NULL;
+    for (uint32_t i = 0; i < chain.count; i++) {
+        if (chain.v[i].sType == VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO) {
+            const VkExportMemoryAllocateInfo *e = (const VkExportMemoryAllocateInfo *)chain.v[i].node;
+            export_types |= (uint32_t)e->handleTypes;
+        } else if (chain.v[i].sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) {
+            dedicated = chain.v[i].node;
+        }
+    }
+    if (dedicated) ((VkBaseInStructure *)dedicated)->pNext = NULL;
+
+    uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    uint64_t rounded = ((info.allocationSize + page - 1) / page) * page;
+
+    VkImportMemoryFdInfoKHR import = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR };
+    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    int backing = vkfw_make_memfd(rounded);
+
+    if (backing >= 0) {
+        import.fd = backing;
+        import.pNext = dedicated;
+        info.pNext = &import;
+        r = fn(device, &info, NULL, &memory);
+        if (r != VK_SUCCESS) {
+            memory = VK_NULL_HANDLE;
+            close(backing);
+            backing = -1;
+            LOGW("allocating %llu bytes through a dma-buf failed (%d); falling back to plain memory",
+                 (unsigned long long)info.allocationSize, r);
+        }
+    }
+    if (r != VK_SUCCESS) {
+        info.pNext = dedicated;
+        r = fn(device, &info, NULL, &memory);
+    }
+    vkfw_chain_free(&chain);
+
+    if (r != VK_SUCCESS || !memory) {
+        if (backing >= 0) close(backing);
+        LOGE("vkAllocateMemory failed (%d) for %llu bytes", r,
+             (unsigned long long)info.allocationSize);
+        vkfw_buf_put_result(req->out, r != VK_SUCCESS ? r : VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        return;
+    }
+
+    uint64_t id = vkfw_handle_add(&req->conn->handles, VKFW_OBJ_DEVICE_MEMORY, memory, dev_id);
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+    vkfw_buf_put_u64(req->out, id);
+    vkfw_buf_put_u64(req->out, info.allocationSize);
+    /* Sent only when we have one; a plain allocation has nothing to hand over
+     * and the client says so when it is asked to map. */
+    req->passfd = backing;
+
+    if (export_types != 0 && backing < 0)
+        LOGW("memory was asked for as an exportable handle but the driver took none");
+}
+
+static void h_free_memory(struct vkfw_request *req, void *unused)
+{
+    (void)unused;
+    uint64_t dev_id = 0, mem_id = 0;
+    if (!vkfw_cur_u64(&req->in, &dev_id) || !vkfw_cur_u64(&req->in, &mem_id)) {
+        vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL);
+        return;
+    }
+    VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
+    VkDeviceMemory memory =
+        (VkDeviceMemory)vkfw_handle_get(&req->conn->handles, mem_id, VKFW_OBJ_DEVICE_MEMORY);
+    PFN_vkFreeMemory fn = (PFN_vkFreeMemory)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id),
+                                                               "vkFreeMemory");
+    if (!device || !memory || !fn) {
+        vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    fn(device, memory, NULL);
+    vkfw_handle_drop(&req->conn->handles, mem_id);
+    vkfw_buf_put_result(req->out, VK_SUCCESS);
+}
+
 /* ---- dispatch ----------------------------------------------------------- */
 
 struct vkfw_entry {
@@ -1260,6 +1417,9 @@ static const struct vkfw_entry kDispatch[] = {
     { VKFW_CMD_DESTROY_IMAGE, h_destroy_image, NULL },
     { VKFW_CMD_GET_IMAGE_MEMORY_REQUIREMENTS, h_get_image_memory_requirements, NULL },
     { VKFW_CMD_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS, h_get_image_sparse_memory_requirements, NULL },
+
+    { VKFW_CMD_ALLOCATE_MEMORY, h_allocate_memory, NULL },
+    { VKFW_CMD_FREE_MEMORY, h_free_memory, NULL },
 };
 
 void vkfw_serve_connection(int fd)
@@ -1276,7 +1436,7 @@ void vkfw_serve_connection(int fd)
     while (vkfw_read_frame(fd, &hdr, &payload)) {
         vkfw_buf reply;
         vkfw_buf_init(&reply);
-        struct vkfw_request req = { .conn = &conn, .seq = hdr.seq, .out = &reply };
+        struct vkfw_request req = { .conn = &conn, .seq = hdr.seq, .out = &reply, .passfd = -1 };
         vkfw_cur_init(&req.in, payload.data, payload.len);
 
         const struct vkfw_entry *entry = NULL;
