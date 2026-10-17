@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -35,14 +36,21 @@ extern void *vk_icdGetInstanceProcAddr(void *instance, const char *name);
         return 1;                                                                              \
     } while (0)
 
+/*
+ * The real server loop, not a copy of it.
+ *
+ * The loopback used to have its own accept loop so it could stay inside one
+ * process, and a private copy is exactly the kind of thing that quietly stops
+ * testing what ships: it served one connection at a time long after the
+ * server stopped doing that, and no test could tell the difference. Running
+ * vkfw_server_main means the loopback exercises the accept path a device
+ * actually uses.
+ */
 static void *accept_thread(void *p)
 {
     int listen_fd = *(int *)p;
-    for (;;) {
-        int client = accept(listen_fd, NULL, NULL);
-        if (client < 0) return NULL;
-        vkfw_serve_connection(client);
-    }
+    vkfw_server_main(listen_fd);
+    return NULL;
 }
 
 static void dump_device_extensions(PFN_vkEnumerateDeviceExtensionProperties fn, VkPhysicalDevice pd);
@@ -465,6 +473,12 @@ static int two_clients(const char *endpoint)
         printf("[clients]   first connection: FAILED\n");
         return 1;
     }
+    /* Both connections get a deadline. The first one is the trap: the ICD's
+     * own connection is still open at this point, so a server that serves one
+     * connection at a time never even accepts this one, and a read with no
+     * deadline waits forever instead of failing. */
+    struct timeval deadline = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(a, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline));
     if (!ask_instance_version(a)) {
         printf("[clients]   first client served: NO\n");
         failures++;
@@ -477,8 +491,7 @@ static int two_clients(const char *endpoint)
         printf("[clients]   second connection: FAILED\n");
         failures++;
     } else {
-        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-        setsockopt(b, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(b, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline));
         if (!ask_instance_version(b)) {
             printf("[clients]   second client served: NO - the server is stuck on the first\n");
             failures++;
@@ -494,6 +507,11 @@ static int two_clients(const char *endpoint)
 
 int main(int argc, char **argv)
 {
+    /* Line buffered: what has been printed so far is the only clue when this
+     * test hangs on CI, and a job that gets killed takes a full stdout buffer
+     * with it. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     const char *driver = getenv("VKFW_DRIVER");
     char default_endpoint[256];
     snprintf(default_endpoint, sizeof(default_endpoint), "%s/vkfw-loopback-%ld.sock",
