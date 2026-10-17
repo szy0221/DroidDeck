@@ -1307,9 +1307,23 @@ static void h_allocate_memory(struct vkfw_request *req, void *unused)
     uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
     uint64_t rounded = ((info.allocationSize + page - 1) / page) * page;
 
-    VkImportMemoryFdInfoKHR import = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR };
-    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    /*
+     * Opaque first, dma-buf second. Both mean the same thing here - an fd to
+     * the memfd we just made - and opaque is the one every driver that has
+     * external memory at all accepts. Importing as a dma-buf asks the driver
+     * to treat it as a buffer it may have to negotiate a layout for, which is
+     * a bigger ask than "here is the memory, use it".
+     *
+     * Exporting is a different question and does not change: a memfd is a
+     * dma-buf as far as anything importing it is concerned, which is exactly
+     * how Mesa hands out its own exportable allocations.
+     */
+    static const VkExternalMemoryHandleTypeFlagBits kImportAs[] = {
+        VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+        VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
 
+    VkImportMemoryFdInfoKHR import = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR };
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     int backing = vkfw_make_memfd(rounded);
@@ -1317,20 +1331,24 @@ static void h_allocate_memory(struct vkfw_request *req, void *unused)
         LOGW("no memfd for %llu bytes (%s): this allocation cannot be mapped or exported",
              (unsigned long long)info.allocationSize, strerror(errno));
 
-    if (backing >= 0) {
+    for (size_t i = 0; backing >= 0 && i < sizeof(kImportAs) / sizeof(kImportAs[0]); i++) {
+        import.handleType = kImportAs[i];
         import.fd = backing;
         import.pNext = dedicated;
         info.pNext = &import;
         r = fn(device, &info, NULL, &memory);
-        if (r != VK_SUCCESS) {
-            memory = VK_NULL_HANDLE;
+        if (r == VK_SUCCESS && memory) break;
+        memory = VK_NULL_HANDLE;
+        LOGW("allocating %llu bytes through a %s import failed (%d)",
+             (unsigned long long)info.allocationSize,
+             kImportAs[i] == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ? "opaque fd" : "dma-buf",
+             r);
+    }
+    if (r != VK_SUCCESS || !memory) {
+        if (backing >= 0) {
             close(backing);
             backing = -1;
-            LOGW("allocating %llu bytes through a dma-buf failed (%d); falling back to plain memory",
-                 (unsigned long long)info.allocationSize, r);
         }
-    }
-    if (r != VK_SUCCESS) {
         info.pNext = dedicated;
         r = fn(device, &info, NULL, &memory);
     }
