@@ -1942,11 +1942,18 @@ static void h_get_semaphore_counter_value(struct vkfw_request *req, void *unused
     VkSemaphore semaphore =
         (VkSemaphore)vkfw_handle_get(&req->conn->handles, sem_id, VKFW_OBJ_SEMAPHORE);
     PFN_vkGetSemaphoreCounterValue fn = (PFN_vkGetSemaphoreCounterValue)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkGetSemaphoreCounterValue");
-    if (!device || !semaphore || !fn) {
-        LOGW("semaphore counter: device=%d semaphore=%d entry=%d (id %llu of %u slots)",
-             device != NULL, semaphore != NULL, fn != NULL, (unsigned long long)sem_id,
-             req->conn->handles.count);
+    if (!device || !semaphore) {
         vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    /*
+     * A device built for Vulkan 1.1 has no vkGetSemaphoreCounterValue to hand
+     * out, and that is what the caller asked for rather than something we got
+     * wrong. Say the feature is not present, which is what it is, so a caller
+     * can tell "this device cannot" apart from "the layer is broken".
+     */
+    if (!fn) {
+        vkfw_buf_put_result(req->out, VK_ERROR_FEATURE_NOT_PRESENT);
         return;
     }
     uint64_t value = 0;
@@ -1967,9 +1974,14 @@ static void h_signal_semaphore(struct vkfw_request *req, void *unused)
     VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
     VkSemaphore semaphore =
         (VkSemaphore)vkfw_handle_get(&req->conn->handles, sem_id, VKFW_OBJ_SEMAPHORE);
-    PFN_vkSignalSemaphore fn = (PFN_vkSignalSemaphore)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkSignalSemaphore");
-    if (!device || !semaphore || !fn) {
+    PFN_vkSignalSemaphore fn = (PFN_vkSignalSemaphore)vkfw_device_proc(
+        vkfw_instance_of(req->conn, dev_id), device, "vkSignalSemaphore");
+    if (!device || !semaphore) {
         vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    if (!fn) {
+        vkfw_buf_put_result(req->out, VK_ERROR_FEATURE_NOT_PRESENT);
         return;
     }
     VkSemaphoreSignalInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };

@@ -338,7 +338,19 @@ static int resource_round_trip(PFN_vkGetInstanceProcAddr gipa, VkDevice device)
         uint64_t value = 0;
         r = get_counter(device, timeline, &value);
         printf("[resources] counter: %llu (%d)\n", (unsigned long long)value, r);
-        if (r != VK_SUCCESS || value != 7) failures++;
+        /*
+         * VK_ERROR_FEATURE_NOT_PRESENT means the device was built for a Vulkan
+         * older than 1.2, where these two commands do not exist at all. The
+         * layer reporting that accurately is the correct answer, not a
+         * failure: the semaphore was still created and is still destroyed
+         * below, and that part is ours to get right.
+         */
+        if (r == VK_ERROR_FEATURE_NOT_PRESENT) {
+            printf("[resources]   this device predates timeline semaphores: not a forwarding "
+                   "failure\n");
+        } else if (r != VK_SUCCESS || value != 7) {
+            failures++;
+        }
 
         VkSemaphoreSignalInfo ssi = { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
         ssi.semaphore = timeline;
@@ -804,7 +816,11 @@ int main(int argc, char **argv)
 
     VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
     app.pApplicationName = "vkforward-loopback";
-    app.apiVersion = VK_MAKE_VERSION(1, 1, 0);
+    /* What a real tool asks for. Asking for 1.1 instead would quietly make
+     * every command Vulkan added since then unavailable on the device - a
+     * timeline semaphore can be created and then not read - and the layer
+     * would look broken when it was only being faithful. */
+    app.apiVersion = VK_MAKE_VERSION(1, 3, 0);
     VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     ici.pApplicationInfo = &app;
 
