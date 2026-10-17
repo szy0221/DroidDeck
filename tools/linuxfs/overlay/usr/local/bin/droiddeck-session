@@ -250,6 +250,32 @@ queue_steam_on_desktop() {
   echo "== steam: the client is queued for the desktop ($dir/steam.sh)"
 }
 
+# Plasma reads its language from the environment, and it cannot set one itself here: the
+# Region & Language module applies a change through org.freedesktop.locale1, which this
+# container does not run - startup logs "Not connected to D-Bus server" for it. Carry the
+# language the app already picked for Steam into the desktop instead.
+desktop_locale() {
+  local steam=${BL_STEAM_LANGUAGE:-} tag=
+  case $steam in
+    schinese) tag=zh_CN ;; tchinese) tag=zh_TW ;; japanese) tag=ja_JP ;; koreana) tag=ko_KR ;;
+    german) tag=de_DE ;; french) tag=fr_FR ;; italian) tag=it_IT ;; spanish) tag=es_ES ;;
+    latam) tag=es_MX ;; portuguese) tag=pt_PT ;; brazilian) tag=pt_BR ;; russian) tag=ru_RU ;;
+    polish) tag=pl_PL ;; turkish) tag=tr_TR ;; thai) tag=th_TH ;; vietnamese) tag=vi_VN ;;
+    ukrainian) tag=uk_UA ;; czech) tag=cs_CZ ;; english) tag=en_US ;;
+  esac
+  echo "== locale: LANG=${LANG:-none} steam=${steam:-none} -> ${tag:-unset}" \
+       "zh_CN=$(ls -d /usr/share/locale/zh_CN 2>/dev/null || echo none)" \
+       "generated=$(locale -a 2>/dev/null | grep -c . )"
+  [ -n "$tag" ] || return 0
+  export LANGUAGE=$tag
+  if locale -a 2>/dev/null | grep -qix -e "${tag}.utf-8" -e "${tag}.utf8" -e "$tag"; then
+    export LANG=${tag}.UTF-8
+    echo "== locale: the desktop runs in $LANG"
+  else
+    echo "== locale: $tag is not generated in this runtime; the desktop keeps the C locale"
+  fi
+}
+
 if [ -z "${BL_INSIDE:-}" ]; then
   /usr/local/bin/droiddeck-fonts 2>&1 | sed 's/^/[fonts] /'
   device_fonts=/usr/local/share/fonts/android
@@ -281,6 +307,7 @@ if [ -z "${BL_INSIDE:-}" ]; then
     start_agent --no-focus
     [ -x /usr/local/bin/droiddeck-desktop ] || { echo "== the desktop package is not installed"; exit 66; }
     [ "${BL_STEAM_AFTER_DESKTOP:-}" = 1 ] && queue_steam_on_desktop
+    desktop_locale
     cores=$(program_cores)
     if [ -n "$cores" ]; then
       echo "== desktop cores: $cores (the desktop and every program started from it)"
