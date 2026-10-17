@@ -171,7 +171,13 @@ program_cores() {
 # the Steam tile there would sit on a black screen forever waiting for a first frame. The
 # launcher sends those devices into the Plasma desktop instead and asks it, with this flag,
 # to bring the Steam client up on its own. The desktop picks up whatever is queued in
-# $HOME/.cache/droiddeck/run once it has a Wayland socket to talk to.
+# $HOME/.cache/droiddeck/run.
+#
+# The runner hands the script WAYLAND_DISPLAY=wayland-1 DISPLAY=:1, which is where the
+# compositor and Xwayland sit under gamescope. There is no gamescope here: Plasma takes
+# the first free socket and Xwayland the first free display, which on the O3 board is
+# wayland-0 and :0. Trusting the inherited pair would send the client to sockets that do
+# not exist, so the script re-reads them off the filesystem.
 queue_steam_on_desktop() {
   local dir=$HOME/.cache/droiddeck/run
   mkdir -p "$dir" || return 0
@@ -180,14 +186,20 @@ queue_steam_on_desktop() {
   {
     echo '#!/bin/bash'
     echo '# queued by droiddeck-session: open the Steam client once the desktop is up'
+    echo 'rt=${XDG_RUNTIME_DIR:-/run/droiddeck}'
     echo 'export BL_DESKTOP=1'
     echo 'for _ in $(seq 1 180); do'
-    echo '  [ -S "${XDG_RUNTIME_DIR:-/run/droiddeck}/wayland-1" ] && break'
+    echo '  [ -n "$(ls -d "$rt"/wayland-* 2>/dev/null)" ] && [ -n "$(ls -d /tmp/.X11-unix/X* 2>/dev/null)" ] && break'
     echo '  sleep 1'
     echo 'done'
-    echo 'sleep 8'
+    echo 'sock=$(ls -t "$rt"/wayland-* 2>/dev/null | head -1)'
+    echo 'x=$(ls -t /tmp/.X11-unix/X* 2>/dev/null | head -1)'
+    echo '[ -n "$sock" ] && export WAYLAND_DISPLAY=${sock##*/}'
+    echo '[ -n "$x" ] && export DISPLAY=:${x##*X}'
+    echo 'echo "== steam: opening the client on $WAYLAND_DISPLAY / $DISPLAY"'
     echo 'for _ in 1 2 3; do'
     echo '  /usr/local/bin/droiddeck-steam-launch desktop && exit 0'
+    echo '  echo "== steam: the client did not start, trying again"'
     echo '  sleep 10'
     echo 'done'
     echo 'echo "== steam: the desktop client never came up" >&2'
