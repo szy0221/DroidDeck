@@ -337,7 +337,7 @@ static int resource_round_trip(PFN_vkGetInstanceProcAddr gipa, VkDevice device)
     } else {
         uint64_t value = 0;
         r = get_counter(device, timeline, &value);
-        printf("[resources] counter: %llu\n", (unsigned long long)value);
+        printf("[resources] counter: %llu (%d)\n", (unsigned long long)value, r);
         if (r != VK_SUCCESS || value != 7) failures++;
 
         VkSemaphoreSignalInfo ssi = { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };

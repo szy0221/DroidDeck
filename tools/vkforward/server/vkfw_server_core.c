@@ -109,6 +109,33 @@ static void *vkfw_instance_proc(VkInstance instance, const char *name)
     return instance ? (void *)(size_t)g_gipa(instance, name) : NULL;
 }
 
+/*
+ * Device commands are asked for of the device.
+ *
+ * Going through the instance works for the commands Vulkan 1.0 defined, and
+ * quietly stops working at 1.2: a driver asked for vkSignalSemaphore on an
+ * instance it was told is older than that answers NULL, not because it cannot
+ * do it but because the question was put to the wrong object. The layer looked
+ * broken in a way that had nothing to do with forwarding - the create calls
+ * around it all worked, so only the newer half of a resource failed.
+ *
+ * vkGetDeviceProcAddr is where a device command is meant to be asked for, and
+ * it answers for every command the device supports. The instance is still the
+ * fallback, for the commands that live there and nowhere else.
+ */
+static void *vkfw_device_proc(VkInstance instance, VkDevice device, const char *name)
+{
+    if (!device) return NULL;
+    PFN_vkGetDeviceProcAddr gdpa =
+        (PFN_vkGetDeviceProcAddr)(instance ? vkfw_instance_proc(instance, "vkGetDeviceProcAddr")
+                                           : NULL);
+    if (gdpa) {
+        void *fn = (void *)(size_t)gdpa(device, name);
+        if (fn) return fn;
+    }
+    return vkfw_instance_proc(instance, name);
+}
+
 /* ---- per-connection state ----------------------------------------------- */
 
 enum vkfw_handle_type {
@@ -1585,7 +1612,7 @@ static void h_create_buffer(struct vkfw_request *req, void *unused)
     if (!vkfw_cur_u64(&req->in, &dev_id)) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
     VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
     PFN_vkCreateBuffer fn =
-        (PFN_vkCreateBuffer)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id), "vkCreateBuffer");
+        (PFN_vkCreateBuffer)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkCreateBuffer");
     if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
 
     VkBufferCreateInfo info;
@@ -1610,8 +1637,7 @@ static void h_create_buffer(struct vkfw_request *req, void *unused)
     uint64_t id = vkfw_handle_add(&req->conn->handles, VKFW_OBJ_BUFFER, buffer, dev_id);
     if (id == 0) {
         PFN_vkDestroyBuffer destroy =
-            (PFN_vkDestroyBuffer)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id),
-                                                   "vkDestroyBuffer");
+            (PFN_vkDestroyBuffer)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkDestroyBuffer");
         if (destroy) destroy(device, buffer, NULL);
         vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY);
         return;
@@ -1634,7 +1660,7 @@ static void h_destroy_buffer(struct vkfw_request *req, void *unused)
                                                 req->conn->handles.v[id - 1].owner, VKFW_OBJ_DEVICE);
     if (device && buffer) {
         PFN_vkDestroyBuffer fn =
-            (PFN_vkDestroyBuffer)vkfw_instance_proc(vkfw_instance_of(req->conn, id), "vkDestroyBuffer");
+            (PFN_vkDestroyBuffer)vkfw_device_proc(vkfw_instance_of(req->conn, id), device, "vkDestroyBuffer");
         if (fn) fn(device, buffer, NULL);
     }
     vkfw_handle_drop(&req->conn->handles, id);
@@ -1651,8 +1677,7 @@ static void h_get_buffer_memory_requirements(struct vkfw_request *req, void *unu
     }
     VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
     VkBuffer buffer = (VkBuffer)vkfw_handle_get(&req->conn->handles, buf_id, VKFW_OBJ_BUFFER);
-    PFN_vkGetBufferMemoryRequirements fn = (PFN_vkGetBufferMemoryRequirements)vkfw_instance_proc(
-        vkfw_instance_of(req->conn, buf_id), "vkGetBufferMemoryRequirements");
+    PFN_vkGetBufferMemoryRequirements fn = (PFN_vkGetBufferMemoryRequirements)vkfw_device_proc(vkfw_instance_of(req->conn, buf_id), device, "vkGetBufferMemoryRequirements");
     if (!device || !buffer || !fn) {
         vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
         return;
@@ -1687,8 +1712,7 @@ static void h_bind_buffer_memory(struct vkfw_request *req, void *unused)
     VkBuffer buffer = (VkBuffer)vkfw_handle_get(&req->conn->handles, buf_id, VKFW_OBJ_BUFFER);
     VkDeviceMemory memory =
         (VkDeviceMemory)vkfw_handle_get(&req->conn->handles, mem_id, VKFW_OBJ_DEVICE_MEMORY);
-    PFN_vkBindBufferMemory fn = (PFN_vkBindBufferMemory)vkfw_instance_proc(
-        vkfw_instance_of(req->conn, dev_id), "vkBindBufferMemory");
+    PFN_vkBindBufferMemory fn = (PFN_vkBindBufferMemory)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkBindBufferMemory");
     if (!device || !buffer || !memory || !fn) {
         vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
         return;
@@ -1710,8 +1734,7 @@ static void h_bind_image_memory(struct vkfw_request *req, void *unused)
     VkImage image = (VkImage)vkfw_handle_get(&req->conn->handles, img_id, VKFW_OBJ_IMAGE);
     VkDeviceMemory memory =
         (VkDeviceMemory)vkfw_handle_get(&req->conn->handles, mem_id, VKFW_OBJ_DEVICE_MEMORY);
-    PFN_vkBindImageMemory fn = (PFN_vkBindImageMemory)vkfw_instance_proc(
-        vkfw_instance_of(req->conn, dev_id), "vkBindImageMemory");
+    PFN_vkBindImageMemory fn = (PFN_vkBindImageMemory)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkBindImageMemory");
     if (!device || !image || !memory || !fn) {
         vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
         return;
@@ -1739,7 +1762,7 @@ static void h_create_fence(struct vkfw_request *req, void *unused)
     }
     VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
     PFN_vkCreateFence fn =
-        (PFN_vkCreateFence)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id), "vkCreateFence");
+        (PFN_vkCreateFence)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkCreateFence");
     if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
 
     VkFenceCreateInfo info = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
@@ -1753,8 +1776,7 @@ static void h_create_fence(struct vkfw_request *req, void *unused)
     uint64_t id = vkfw_handle_add(&req->conn->handles, VKFW_OBJ_FENCE, fence, dev_id);
     if (id == 0) {
         PFN_vkDestroyFence destroy =
-            (PFN_vkDestroyFence)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id),
-                                                   "vkDestroyFence");
+            (PFN_vkDestroyFence)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkDestroyFence");
         if (destroy) destroy(device, fence, NULL);
         vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY);
         return;
@@ -1803,7 +1825,7 @@ static void h_reset_fences(struct vkfw_request *req, void *unused)
     if (count > 64) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
     VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
     PFN_vkResetFences fn =
-        (PFN_vkResetFences)vkfw_instance_proc(vkfw_instance_of(req->conn, dev_id), "vkResetFences");
+        (PFN_vkResetFences)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkResetFences");
     if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
 
     VkFence fences[64];
@@ -1826,8 +1848,7 @@ static void h_get_fence_status(struct vkfw_request *req, void *unused)
     }
     VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
     VkFence fence = (VkFence)vkfw_handle_get(&req->conn->handles, fence_id, VKFW_OBJ_FENCE);
-    PFN_vkGetFenceStatus fn = (PFN_vkGetFenceStatus)vkfw_instance_proc(
-        vkfw_instance_of(req->conn, dev_id), "vkGetFenceStatus");
+    PFN_vkGetFenceStatus fn = (PFN_vkGetFenceStatus)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkGetFenceStatus");
     if (!device || !fence || !fn) {
         vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
         return;
@@ -1847,8 +1868,7 @@ static void h_wait_for_fences(struct vkfw_request *req, void *unused)
     }
     if (count > 64) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
     VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
-    PFN_vkWaitForFences fn = (PFN_vkWaitForFences)vkfw_instance_proc(
-        vkfw_instance_of(req->conn, dev_id), "vkWaitForFences");
+    PFN_vkWaitForFences fn = (PFN_vkWaitForFences)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkWaitForFences");
     if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
 
     VkFence fences[64];
@@ -1878,8 +1898,7 @@ static void h_create_semaphore(struct vkfw_request *req, void *unused)
         return;
     }
     VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
-    PFN_vkCreateSemaphore fn = (PFN_vkCreateSemaphore)vkfw_instance_proc(
-        vkfw_instance_of(req->conn, dev_id), "vkCreateSemaphore");
+    PFN_vkCreateSemaphore fn = (PFN_vkCreateSemaphore)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkCreateSemaphore");
     if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
 
     VkSemaphoreCreateInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
@@ -1902,8 +1921,7 @@ static void h_create_semaphore(struct vkfw_request *req, void *unused)
     }
     uint64_t id = vkfw_handle_add(&req->conn->handles, VKFW_OBJ_SEMAPHORE, semaphore, dev_id);
     if (id == 0) {
-        PFN_vkDestroySemaphore destroy = (PFN_vkDestroySemaphore)vkfw_instance_proc(
-            vkfw_instance_of(req->conn, dev_id), "vkDestroySemaphore");
+        PFN_vkDestroySemaphore destroy = (PFN_vkDestroySemaphore)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkDestroySemaphore");
         if (destroy) destroy(device, semaphore, NULL);
         vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY);
         return;
@@ -1923,8 +1941,7 @@ static void h_get_semaphore_counter_value(struct vkfw_request *req, void *unused
     VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
     VkSemaphore semaphore =
         (VkSemaphore)vkfw_handle_get(&req->conn->handles, sem_id, VKFW_OBJ_SEMAPHORE);
-    PFN_vkGetSemaphoreCounterValue fn = (PFN_vkGetSemaphoreCounterValue)vkfw_instance_proc(
-        vkfw_instance_of(req->conn, dev_id), "vkGetSemaphoreCounterValue");
+    PFN_vkGetSemaphoreCounterValue fn = (PFN_vkGetSemaphoreCounterValue)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkGetSemaphoreCounterValue");
     if (!device || !semaphore || !fn) {
         vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
         return;
@@ -1947,8 +1964,7 @@ static void h_signal_semaphore(struct vkfw_request *req, void *unused)
     VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
     VkSemaphore semaphore =
         (VkSemaphore)vkfw_handle_get(&req->conn->handles, sem_id, VKFW_OBJ_SEMAPHORE);
-    PFN_vkSignalSemaphore fn = (PFN_vkSignalSemaphore)vkfw_instance_proc(
-        vkfw_instance_of(req->conn, dev_id), "vkSignalSemaphore");
+    PFN_vkSignalSemaphore fn = (PFN_vkSignalSemaphore)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkSignalSemaphore");
     if (!device || !semaphore || !fn) {
         vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
         return;
@@ -1971,8 +1987,7 @@ static void h_wait_semaphores(struct vkfw_request *req, void *unused)
     }
     if (count > 64) { vkfw_buf_put_result(req->out, VKFW_ERR_PROTOCOL); return; }
     VkDevice device = (VkDevice)vkfw_handle_get(&req->conn->handles, dev_id, VKFW_OBJ_DEVICE);
-    PFN_vkWaitSemaphores fn = (PFN_vkWaitSemaphores)vkfw_instance_proc(
-        vkfw_instance_of(req->conn, dev_id), "vkWaitSemaphores");
+    PFN_vkWaitSemaphores fn = (PFN_vkWaitSemaphores)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkWaitSemaphores");
     if (!device || !fn) { vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED); return; }
 
     VkSemaphore semaphores[64];
