@@ -19,6 +19,12 @@ object VkForwardServer {
 
     @Volatile private var listeners = 0
 
+    // @JvmStatic is load-bearing, not decoration: without it Kotlin emits an
+    // instance method and passes `this` as an argument the native side is not
+    // expecting, so every parameter lands one slot off and the jstring is read
+    // as a jobject. The C side is written for the static signature, as the
+    // rest of the app's native methods are.
+    @JvmStatic
     private external fun nativeStart(endpoint: String): Int
 
     /**
@@ -35,11 +41,24 @@ object VkForwardServer {
         // Say why we are not starting. A device with no listener and no log for
         // it is indistinguishable from one whose code was never shipped, and
         // the session log is the only thing to read out here.
-        if (!GpuInfo.isMaliDevice("")) {
+        val mali = GpuInfo.isMaliDevice("")
+        val ok = if (!mali) {
             Log.i(TAG, "not a Mali device, leaving the server down")
-            return false
+            false
+        } else {
+            start()
         }
-        return start()
+        // Into the session bundle as well: the app's own log for a session
+        // starts after this runs, so anything said here is otherwise lost.
+        try {
+            com.droiddeck.launcher.session.SessionEvents.record(
+                "vkforward.server",
+                mapOf("mali" to mali, "started" to ok, "listening" to (listeners > 0)),
+            )
+        } catch (_: Throwable) {
+            // Recording is diagnostics; never let it stop the session.
+        }
+        return ok
     }
 
     /** Starts the accept loop. Safe to call more than once per process. */
@@ -53,8 +72,10 @@ object VkForwardServer {
             System.loadLibrary("vkforward_server")
             nativeStart(SOCKET_NAME)
         } catch (t: Throwable) {
-            Log.w(TAG, "vkforward server not available", t)
-            -1
+            // A signature mismatch lands here too, and reads like a missing
+            // library, so name the method in the message.
+            Log.w(TAG, "nativeStart failed: ${t.javaClass.simpleName}: ${t.message}", t)
+            -9
         }
         if (fd < 0) {
             Log.w(TAG, "server not started (native error $fd: ${explain(fd)})")
@@ -71,6 +92,7 @@ object VkForwardServer {
         -2 -> "cannot bind abstract socket '$SOCKET_NAME'"
         -3 -> "cannot start the accept loop"
         -4 -> "no socket name given"
+        -9 -> "the native method could not be called at all"
         else -> "unknown"
     }
 }

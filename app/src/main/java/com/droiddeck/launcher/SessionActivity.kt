@@ -1315,6 +1315,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (!SessionState.running) SessionEvents.record("compositor.started")
         if (!SessionState.running) {
             SessionEvents.transition(SessionPhase.STARTING_GUEST, "guest.starting")
+            // Route B: the runtime's ICD connects while the session boots, so
+            // the listener has to be up before the guest starts, not merely by
+            // the time the app came up. Safe to call again: it starts once.
+            com.droiddeck.launcher.gpu.VkForwardServer.startOnMali()
             SessionService.start(
                 this, intent.getStringExtra(SessionService.EXTRA_MODE) ?: SessionService.MODE_STEAM,
                 intent.getStringExtra(SessionService.EXTRA_PROGRAM),
