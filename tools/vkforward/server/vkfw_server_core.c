@@ -1285,6 +1285,71 @@ static bool vkfw_memory_importable(struct vkfw_conn *c, uint64_t dev_id,
             VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
 }
 
+/*
+ * Allocating on a thread we can walk away from.
+ *
+ * A driver is entitled to refuse an import; it is not entitled to hang, but
+ * lavapipe does exactly that when handed a dma-buf - and it reports both
+ * handle types as importable when asked, so there is no query that rules it
+ * out beforehand. The caller upstream of us has a timeout of its own and no
+ * way to explain what it is waiting for, so a hang here becomes a dead
+ * session rather than an error anyone can act on.
+ *
+ * So the attempt gets a budget. If the driver comes back within it we join
+ * the thread and use the answer; if it does not, we leave the thread where it
+ * is - we cannot take back a call we have already made - and fall back to
+ * memory the driver will definitely allocate. Once a driver has hung on a
+ * handle type we do not offer it that type again.
+ */
+#define VKFW_IMPORT_BUDGET_SECONDS 10
+
+struct vkfw_alloc_job {
+    PFN_vkAllocateMemory fn;
+    VkDevice device;
+    VkMemoryAllocateInfo info;
+    VkImportMemoryFdInfoKHR import;
+    void *dedicated;
+    VkDeviceMemory memory;
+    VkResult result;
+    bool done;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+};
+
+static void *vkfw_alloc_thread(void *p)
+{
+    struct vkfw_alloc_job *j = (struct vkfw_alloc_job *)p;
+    j->result = j->fn(j->device, &j->info, NULL, &j->memory);
+    pthread_mutex_lock(&j->lock);
+    j->done = true;
+    pthread_cond_signal(&j->cond);
+    pthread_mutex_unlock(&j->lock);
+    return NULL;
+}
+
+/* false means the driver never answered; the job is then deliberately leaked,
+ * because the thread inside it still holds a pointer to it. */
+static bool vkfw_alloc_bounded(struct vkfw_alloc_job *j)
+{
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, vkfw_alloc_thread, j) != 0) return false;
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += VKFW_IMPORT_BUDGET_SECONDS;
+
+    pthread_mutex_lock(&j->lock);
+    while (!j->done) {
+        if (pthread_cond_timedwait(&j->cond, &j->lock, &deadline) == ETIMEDOUT) break;
+    }
+    bool done = j->done;
+    pthread_mutex_unlock(&j->lock);
+
+    if (done) pthread_join(thread, NULL);
+    else pthread_detach(thread);
+    return done;
+}
+
 static int vkfw_make_memfd(uint64_t size)
 {
     int fd = -1;
@@ -1358,7 +1423,6 @@ static void h_allocate_memory(struct vkfw_request *req, void *unused)
 
     static bool imports_reported = false;
 
-    VkImportMemoryFdInfoKHR import = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR };
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     int backing = vkfw_make_memfd(rounded);
@@ -1375,14 +1439,47 @@ static void h_allocate_memory(struct vkfw_request *req, void *unused)
         LOGI("memory imports: opaque_fd=%d dma_buf=%d", can_opaque, can_dma_buf);
     }
 
+    /* Handle types a driver has hung on; never offered twice. */
+    static bool hung_opaque = false, hung_dma_buf = false;
+
     for (size_t i = 0; backing >= 0 && i < sizeof(kImportAs) / sizeof(kImportAs[0]); i++) {
-        if (kImportAs[i] == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT && !can_opaque) continue;
-        if (kImportAs[i] == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT && !can_dma_buf) continue;
-        import.handleType = kImportAs[i];
-        import.fd = backing;
-        import.pNext = dedicated;
-        info.pNext = &import;
-        r = fn(device, &info, NULL, &memory);
+        if (kImportAs[i] == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
+            (!can_opaque || hung_opaque))
+            continue;
+        if (kImportAs[i] == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
+            (!can_dma_buf || hung_dma_buf))
+            continue;
+
+        struct vkfw_alloc_job *job = calloc(1, sizeof(*job));
+        if (!job) break;
+        job->fn = fn;
+        job->device = device;
+        job->info = info;
+        job->import.handleType = kImportAs[i];
+        job->import.fd = backing;
+        job->import.pNext = dedicated;
+        job->info.pNext = &job->import;
+        pthread_mutex_init(&job->lock, NULL);
+        pthread_cond_init(&job->cond, NULL);
+
+        bool answered = vkfw_alloc_bounded(job);
+        if (!answered) {
+            if (kImportAs[i] == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) hung_opaque = true;
+            else hung_dma_buf = true;
+            LOGW("allocating %llu bytes through a %s import did not come back in %d s",
+                 (unsigned long long)info.allocationSize,
+                 kImportAs[i] == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ? "opaque fd"
+                                                                              : "dma-buf",
+                 VKFW_IMPORT_BUDGET_SECONDS);
+            continue;
+        }
+
+        r = job->result;
+        memory = job->memory;
+        pthread_mutex_destroy(&job->lock);
+        pthread_cond_destroy(&job->cond);
+        free(job);
+
         if (r == VK_SUCCESS && memory) break;
         memory = VK_NULL_HANDLE;
         LOGW("allocating %llu bytes through a %s import failed (%d)",
