@@ -265,6 +265,18 @@ class SessionService : Service() {
         return lines
     }
 
+    /**
+     * gamescope composites through a DRM render node, and on a Mali board there is no
+     * /dev/dri to hand it - the compositor never draws, so the Steam tile on the home
+     * screen stays black forever. Those devices go into the Plasma desktop instead, which
+     * starts the Steam client itself once it is up.
+     */
+    private fun sessionScriptMode(): String {
+        if (SessionState.mode != MODE_STEAM) return SessionState.mode
+        if (LinuxRuntime.hasAdreno()) return MODE_STEAM
+        return MODE_DESKTOP
+    }
+
     private fun tuDebug(linuxDriverId: String): String? {
         val override = File(Environment.getExternalStorageDirectory(), TU_DEBUG_SWITCH)
             .takeIf { it.isFile }?.let { FileUtils.readString(it)?.trim() }
@@ -345,6 +357,11 @@ class SessionService : Service() {
         guest.add("BL_LAUNCH_DIR=" + sessionRoot.path)
         GameStorage.effective(this)?.let { guest.add("BL_LIBRARY_LABEL=" + it.label.replace('"', ' ')) }
         if (SessionState.mode == MODE_STEAM && SessionState.steamUi == "desktop") guest.add("BL_STEAM_UI=desktop")
+        val scriptMode = sessionScriptMode()
+        if (scriptMode != SessionState.mode) {
+            guest.add("BL_STEAM_AFTER_DESKTOP=1")
+            Log.i(TAG, "steam: no Adreno GPU, the session starts on the Plasma desktop instead")
+        }
         val shellGuest = ArrayList(guest).apply {
             add("SHELL=/bin/bash")
             add("TERM=xterm-256color")
@@ -353,8 +370,8 @@ class SessionService : Service() {
             add("cd \"\$HOME\" && exec /bin/bash -i")
         }
         guest.add(LinuxRuntime.SESSION_SCRIPT)
-        guest.add(SessionState.mode)
-        if (SessionState.mode == MODE_STEAM) SessionState.steamUrl?.takeIf { it.startsWith("steam://") }?.let {
+        guest.add(scriptMode)
+        if (scriptMode == MODE_STEAM) SessionState.steamUrl?.takeIf { it.startsWith("steam://") }?.let {
             guest.add(it)
             Log.i(TAG, "steam: handing the client $it")
         }

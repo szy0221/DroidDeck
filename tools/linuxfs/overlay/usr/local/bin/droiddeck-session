@@ -167,6 +167,35 @@ program_cores() {
   echo "$list"
 }
 
+# gamescope composites through a DRM render node. A Mali board has no /dev/dri at all, so
+# the Steam tile there would sit on a black screen forever waiting for a first frame. The
+# launcher sends those devices into the Plasma desktop instead and asks it, with this flag,
+# to bring the Steam client up on its own. The desktop picks up whatever is queued in
+# $HOME/.cache/droiddeck/run once it has a Wayland socket to talk to.
+queue_steam_on_desktop() {
+  local dir=$HOME/.cache/droiddeck/run
+  mkdir -p "$dir" || return 0
+  rm -f "$dir"/steam.sh.running
+  touch "$HOME/.droiddeck-remote-run"
+  {
+    echo '#!/bin/bash'
+    echo '# queued by droiddeck-session: open the Steam client once the desktop is up'
+    echo 'export BL_DESKTOP=1'
+    echo 'for _ in $(seq 1 180); do'
+    echo '  [ -S "${XDG_RUNTIME_DIR:-/run/droiddeck}/wayland-1" ] && break'
+    echo '  sleep 1'
+    echo 'done'
+    echo 'sleep 8'
+    echo 'for _ in 1 2 3; do'
+    echo '  /usr/local/bin/droiddeck-steam-launch desktop && exit 0'
+    echo '  sleep 10'
+    echo 'done'
+    echo 'echo "== steam: the desktop client never came up" >&2'
+    echo 'exit 69'
+  } > "$dir/steam.sh"
+  echo "== steam: the client is queued for the desktop ($dir/steam.sh)"
+}
+
 if [ -z "${BL_INSIDE:-}" ]; then
   /usr/local/bin/droiddeck-fonts 2>&1 | sed 's/^/[fonts] /'
   device_fonts=/usr/local/share/fonts/android
@@ -197,6 +226,7 @@ if [ -z "${BL_INSIDE:-}" ]; then
     step "starting the desktop"
     start_agent --no-focus
     [ -x /usr/local/bin/droiddeck-desktop ] || { echo "== the desktop package is not installed"; exit 66; }
+    [ "${BL_STEAM_AFTER_DESKTOP:-}" = 1 ] && queue_steam_on_desktop
     cores=$(program_cores)
     if [ -n "$cores" ]; then
       echo "== desktop cores: $cores (the desktop and every program started from it)"
