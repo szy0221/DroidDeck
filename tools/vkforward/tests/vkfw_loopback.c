@@ -363,6 +363,36 @@ static int wsi_round_trip(PFN_vkGetInstanceProcAddr gipa)
     if (f && fmt_count) fmts(pds[0], surface, &fmt_count, f);
     if (!f || fmt_count == 0) failures++;
 
+    /* Presenting itself is not here yet, but the entry points have to be: a
+     * missing one is a jump through whatever the loader left behind, not an
+     * error a compositor could report. They must answer, and say no. */
+    PFN_vkCreateSwapchainKHR make_chain =
+        (PFN_vkCreateSwapchainKHR)igipa(wsi_instance, "vkCreateSwapchainKHR");
+    PFN_vkDestroySwapchainKHR kill_chain =
+        (PFN_vkDestroySwapchainKHR)igipa(wsi_instance, "vkDestroySwapchainKHR");
+    PFN_vkQueuePresentKHR present = (PFN_vkQueuePresentKHR)igipa(wsi_instance, "vkQueuePresentKHR");
+    PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR wayland_ok =
+        (PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR)igipa(
+            wsi_instance, "vkGetPhysicalDeviceWaylandPresentationSupportKHR");
+
+    printf("[wsi] wayland presentation supported: %s\n",
+           wayland_ok && wayland_ok(pds[0], 0, NULL) ? "yes" : "no");
+    if (!wayland_ok || !wayland_ok(pds[0], 0, NULL)) failures++;
+
+    if (!make_chain || !kill_chain || !present) {
+        printf("[wsi] swapchain entry points: missing\n");
+        failures++;
+    } else {
+        VkSwapchainKHR chain = VK_NULL_HANDLE;
+        r = make_chain(VK_NULL_HANDLE, NULL, NULL, &chain);
+        /* It must refuse rather than jump through an absent implementation. */
+        printf("[wsi] vkCreateSwapchainKHR refuses cleanly: %s (chain %s)\n",
+               r != VK_SUCCESS ? "yes" : "NO, it claimed to work",
+               chain ? "returned" : "left null");
+        if (r == VK_SUCCESS || chain) failures++;
+        kill_chain(VK_NULL_HANDLE, chain, NULL);
+    }
+
     PFN_vkDestroySurfaceKHR kill =
         (PFN_vkDestroySurfaceKHR)igipa(wsi_instance, "vkDestroySurfaceKHR");
     if (kill) kill(wsi_instance, surface, NULL);

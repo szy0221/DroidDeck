@@ -74,6 +74,10 @@ typedef int32_t (*PFN_vkCreateWaylandSurfaceKHR)(void *instance,
                                                  const VkWaylandSurfaceCreateInfoKHR *pCreateInfo,
                                                  const void *pAllocator,
                                                  void *pSurface);
+
+typedef uint32_t (*PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR)(void *physicalDevice,
+                                                                        uint32_t queueFamilyIndex,
+                                                                        void *display);
 #endif
 
 /* True when the ICD serves this extension itself, so the driver must not be

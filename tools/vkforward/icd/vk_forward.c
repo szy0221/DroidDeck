@@ -1560,6 +1560,86 @@ static VkResult vkfw_vkGetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice 
     return n < available ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+/* Presentation is the half of WSI this layer does not have yet. A swapchain
+ * image has to be real driver memory, and nothing here can allocate it, bind
+ * it, or get a rendered frame out of it yet - that needs the memory, binding
+ * and submit commands, which are their own piece of work.
+ *
+ * Those commands answer instead of being absent. An entry point we do not
+ * serve at all becomes whatever address the loader left in its dispatch table,
+ * and that is not a refusal an application can report: it is a jump to zero.
+ * Saying no is worth more than the alternative even before yes exists. */
+static VkResult vkfw_wsi_not_yet(const char *pName)
+{
+    fprintf(stderr, "[vkforward] %s is not implemented yet: presenting a frame "
+                    "needs real swapchain images, which the forwarding layer "
+                    "cannot allocate yet\n",
+            pName);
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+static VkBool32 vkfw_vkGetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice physicalDevice,
+                                                                     uint32_t queueFamilyIndex,
+                                                                     void *display)
+{
+    (void)physicalDevice;
+    (void)queueFamilyIndex;
+    (void)display;
+    /* True, and not because the driver was asked: the surface is ours, so
+     * nothing here depends on which display the compositor handed us. */
+    return VK_TRUE;
+}
+
+static VkResult vkfw_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo,
+                                          const VkAllocationCallbacks *pAllocator,
+                                          VkSwapchainKHR *pSwapchain)
+{
+    (void)device;
+    (void)pCreateInfo;
+    (void)pAllocator;
+    if (pSwapchain) *pSwapchain = VK_NULL_HANDLE;
+    return vkfw_wsi_not_yet("vkCreateSwapchainKHR");
+}
+
+static void vkfw_vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
+                                       const VkAllocationCallbacks *pAllocator)
+{
+    /* Nothing was created, so there is nothing to undo - but the caller will
+     * call this on the way down whether creation succeeded or not. */
+    (void)device;
+    (void)swapchain;
+    (void)pAllocator;
+}
+
+static VkResult vkfw_vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
+                                             uint32_t *pSwapchainImageCount, VkImage *pSwapchainImages)
+{
+    (void)device;
+    (void)swapchain;
+    (void)pSwapchainImages;
+    if (pSwapchainImageCount) *pSwapchainImageCount = 0;
+    return vkfw_wsi_not_yet("vkGetSwapchainImagesKHR");
+}
+
+static VkResult vkfw_vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+                                           VkSemaphore semaphore, VkFence fence, uint32_t *pImageIndex)
+{
+    (void)device;
+    (void)swapchain;
+    (void)timeout;
+    (void)semaphore;
+    (void)fence;
+    if (pImageIndex) *pImageIndex = 0;
+    return vkfw_wsi_not_yet("vkAcquireNextImageKHR");
+}
+
+static VkResult vkfw_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
+{
+    (void)queue;
+    (void)pPresentInfo;
+    return vkfw_wsi_not_yet("vkQueuePresentKHR");
+}
+
 /* ---- dispatchables ------------------------------------------------------ */
 
 /* Set VKFW_TRACE=1 to log the entry points we cannot serve. Those are exactly
@@ -1670,6 +1750,12 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetInstanceProcAddr(VkIns
     ENTRY(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
     ENTRY(vkGetPhysicalDeviceSurfaceFormatsKHR);
     ENTRY(vkGetPhysicalDeviceSurfacePresentModesKHR);
+    ENTRY(vkGetPhysicalDeviceWaylandPresentationSupportKHR);
+    ENTRY(vkCreateSwapchainKHR);
+    ENTRY(vkDestroySwapchainKHR);
+    ENTRY(vkGetSwapchainImagesKHR);
+    ENTRY(vkAcquireNextImageKHR);
+    ENTRY(vkQueuePresentKHR);
     /* Pre-promotion aliases: tools that enable VK_KHR_get_physical_device_properties2
      * still call these commands under their KHR names, and the EXT-suffixed tool
      * properties is the same command, so all spellings must resolve. */
@@ -1715,6 +1801,11 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetDeviceProcAddr(VkDevic
     ENTRY(vkDestroyImage);
     ENTRY(vkGetImageMemoryRequirements);
     ENTRY(vkGetImageSparseMemoryRequirements);
+    ENTRY(vkCreateSwapchainKHR);
+    ENTRY(vkDestroySwapchainKHR);
+    ENTRY(vkGetSwapchainImagesKHR);
+    ENTRY(vkAcquireNextImageKHR);
+    ENTRY(vkQueuePresentKHR);
 #undef ENTRY
 #undef ALIAS
     return vkfw_absent("device", pName);
