@@ -1123,6 +1123,64 @@ static void vkfw_vkGetPhysicalDeviceExternalSemaphoreProperties(
     vkfw_buf_free(&reply);
 }
 
+/*
+ * What the driver on the other end of the socket can actually do, once.
+ *
+ * Everything the layer does up to creating a device looks the same on any
+ * driver. Everything after it - memory a compositor can import, a frame it can
+ * show - depends on the driver handing out dma-bufs, and whether it does is
+ * the first thing that decides whether this route can go anywhere on a given
+ * tablet. There is no shell and no vulkaninfo in the runtime image, so a line
+ * in the session log is the only way to find out.
+ */
+static void vkfw_log_driver_capabilities(VkPhysicalDevice pd)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static bool reported = false;
+
+    pthread_mutex_lock(&lock);
+    bool mine = !reported;
+    reported = true;
+    pthread_mutex_unlock(&lock);
+    if (!mine) return;
+
+    uint32_t count = 0;
+    if (vkfw_vkEnumerateDeviceExtensionProperties(pd, NULL, &count, NULL) != VK_SUCCESS || count == 0)
+        return;
+    VkExtensionProperties *props = calloc(count, sizeof(*props));
+    if (!props) return;
+    uint32_t got = count;
+    if (vkfw_vkEnumerateDeviceExtensionProperties(pd, NULL, &got, props) != VK_SUCCESS) {
+        free(props);
+        return;
+    }
+
+    static const struct { const char *name; const char *tag; } wanted[] = {
+        { "VK_KHR_external_memory_fd", "external_memory_fd" },
+        { "VK_EXT_external_memory_dma_buf", "dma_buf" },
+        { "VK_EXT_image_drm_format_modifier", "drm_format_modifier" },
+        { "VK_KHR_external_semaphore_fd", "external_semaphore_fd" },
+        { "VK_KHR_external_fence_fd", "external_fence_fd" },
+        { "VK_KHR_image_format_list", "image_format_list" },
+        { "VK_EXT_queue_family_foreign", "queue_family_foreign" },
+    };
+
+    fprintf(stderr, "[vkforward] driver capabilities:");
+    for (uint32_t i = 0; i < sizeof(wanted) / sizeof(wanted[0]); i++) {
+        bool have = false;
+        for (uint32_t j = 0; j < got; j++) {
+            if (strcmp(props[j].extensionName, wanted[i].name) == 0) {
+                have = true;
+                break;
+            }
+        }
+        fprintf(stderr, " %s=%d", wanted[i].tag, have ? 1 : 0);
+    }
+    fprintf(stderr, " (%u device extensions)\n", got);
+    fflush(stderr);
+    free(props);
+}
+
 static VkResult vkfw_vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *info,
                                   const VkAllocationCallbacks *pAllocator, VkDevice *pDevice)
 {
@@ -1182,6 +1240,8 @@ static VkResult vkfw_vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInf
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     vkfw_buf_free(&reply);
+
+    vkfw_log_driver_capabilities(pd);
 
     struct vkfw_device *dev = calloc(1, sizeof(*dev));
     if (!dev) return VK_ERROR_OUT_OF_HOST_MEMORY;
