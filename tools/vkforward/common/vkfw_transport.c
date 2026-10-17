@@ -191,20 +191,47 @@ static void vkfw_report_unreachable(const char *env, int fs_errno, int abstract_
     fflush(stderr);
 }
 
+/* The other half of the report above: knowing the socket was reached tells
+ * you the server is up and the fault is further along. One line per process,
+ * which is a fair price for not having to guess from silence. */
+static void vkfw_report_connected(const char *endpoint, bool abstract)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static bool reported = false;
+
+    pthread_mutex_lock(&lock);
+    bool mine = !reported;
+    reported = true;
+    pthread_mutex_unlock(&lock);
+    if (!mine) return;
+
+    fprintf(stderr, "[vkforward] connected to %s%s\n", abstract ? "@" : "", endpoint);
+    fflush(stderr);
+}
+
 static int vkfw_open_endpoint(void)
 {
     const char *env = getenv(VKFW_SOCKET_ENV);
     if (env && *env) {
         bool abstract = (env[0] == '@');
         int fd = vkfw_try_connect(abstract ? env + 1 : env, abstract);
-        if (fd >= 0) return fd;
+        if (fd >= 0) {
+            vkfw_report_connected(abstract ? env + 1 : env, abstract);
+            return fd;
+        }
     }
     int fd = vkfw_try_connect(VKFW_FS_SOCKET, false);
-    if (fd >= 0) return fd;
+    if (fd >= 0) {
+        vkfw_report_connected(VKFW_FS_SOCKET, false);
+        return fd;
+    }
     int fs_errno = errno;
 
     fd = vkfw_try_connect(VKFW_ABSTRACT_NAME, true);
-    if (fd >= 0) return fd;
+    if (fd >= 0) {
+        vkfw_report_connected(VKFW_ABSTRACT_NAME, true);
+        return fd;
+    }
 
     vkfw_report_unreachable(env, fs_errno, errno);
     return -1;
