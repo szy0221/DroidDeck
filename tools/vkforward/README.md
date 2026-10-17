@@ -162,7 +162,18 @@ on every change.
   what an app checks before using the extension.
 - `vkCreateInstance` forwards app/engine info and enabled names only; the
   loader's own pNext nodes do not cross the socket.
-- Window system integration is not forwarded — gamescope owns presentation.
+- **Window system integration is the ICD's own, not the driver's.** A Wayland
+  compositor asks for `VK_KHR_surface`, `VK_KHR_swapchain`,
+  `VK_KHR_wayland_surface` and `VK_EXT_surface_maintenance1`, and an Android
+  driver has never provided any of them: it answers in `VK_KHR_android_surface`,
+  and a `wl_display *` from another process means nothing here. So the ICD
+  serves those four itself, and the server strips them before anything reaches
+  the driver — otherwise the driver simply refuses to create the instance. The
+  list lives once, in `vkfw_protocol.h`, and both halves use it.
+  Surfaces, support queries, formats and modes are complete; **presenting is
+  not**: `vkCreateSwapchainKHR` and friends answer `VK_ERROR_FEATURE_NOT_PRESENT`
+  and say so on stderr, because real swapchain images need the memory, binding
+  and submit commands that do not exist yet.
 - No Vulkan layers in this ICD.
 - The loader resolves promoted `...2KHR` aliases only while their extension is
   enabled; without it the ICD sees the core spellings, which is what it serves.
