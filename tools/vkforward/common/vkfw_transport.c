@@ -170,6 +170,27 @@ static int vkfw_try_connect(const char *endpoint, bool abstract)
     return fd;
 }
 
+/* A session log is all there is to debug with on a device, and a failed
+ * connect used to be silent: the caller saw VK_ERROR_INITIALIZATION_FAILED
+ * with nothing saying which endpoint was tried or why it refused. Say it
+ * once per process, since every command would otherwise repeat it. */
+static void vkfw_report_unreachable(const char *env, int fs_errno, int abstract_errno)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static bool reported = false;
+
+    pthread_mutex_lock(&lock);
+    bool mine = !reported;
+    reported = true;
+    pthread_mutex_unlock(&lock);
+    if (!mine) return;
+
+    fprintf(stderr, "[vkforward] no server reachable: %s (%s): %s; @%s: %s\n",
+            VKFW_FS_SOCKET, (env && *env) ? env : VKFW_SOCKET_ENV " unset",
+            strerror(fs_errno), VKFW_ABSTRACT_NAME, strerror(abstract_errno));
+    fflush(stderr);
+}
+
 static int vkfw_open_endpoint(void)
 {
     const char *env = getenv(VKFW_SOCKET_ENV);
@@ -180,7 +201,13 @@ static int vkfw_open_endpoint(void)
     }
     int fd = vkfw_try_connect(VKFW_FS_SOCKET, false);
     if (fd >= 0) return fd;
-    return vkfw_try_connect(VKFW_ABSTRACT_NAME, true);
+    int fs_errno = errno;
+
+    fd = vkfw_try_connect(VKFW_ABSTRACT_NAME, true);
+    if (fd >= 0) return fd;
+
+    vkfw_report_unreachable(env, fs_errno, errno);
+    return -1;
 }
 
 int vkfw_client_fd(void) { return g_client_fd; }

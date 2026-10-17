@@ -32,7 +32,13 @@ object VkForwardServer {
      */
     @Synchronized
     fun startOnMali(): Boolean {
-        if (!GpuInfo.isMaliDevice("")) return false
+        // Say why we are not starting. A device with no listener and no log for
+        // it is indistinguishable from one whose code was never shipped, and
+        // the session log is the only thing to read out here.
+        if (!GpuInfo.isMaliDevice("")) {
+            Log.i(TAG, "not a Mali device, leaving the server down")
+            return false
+        }
         return start()
     }
 
@@ -50,9 +56,21 @@ object VkForwardServer {
             Log.w(TAG, "vkforward server not available", t)
             -1
         }
-        if (fd < 0) return false
+        if (fd < 0) {
+            Log.w(TAG, "server not started (native error $fd: ${explain(fd)})")
+            return false
+        }
         listeners++
         Log.i(TAG, "vkforward server up, abstract socket '$SOCKET_NAME'")
         return true
+    }
+
+    /** The native error codes, so a negative result says more than "failed". */
+    private fun explain(code: Int): String = when (code) {
+        -1 -> "no Vulkan library to forward to"
+        -2 -> "cannot bind abstract socket '$SOCKET_NAME'"
+        -3 -> "cannot start the accept loop"
+        -4 -> "no socket name given"
+        else -> "unknown"
     }
 }
