@@ -29,6 +29,71 @@
 #define VKFW_FS_SOCKET "/tmp/vkforward.sock"
 #define VKFW_ABSTRACT_NAME "vkforward"
 
+/* ---- window system integration ------------------------------------------
+ *
+ * The ICD owns WSI, the driver does not take part. Android's Mali driver only
+ * offers VK_KHR_android_surface: it has never heard of a Wayland compositor,
+ * and it cannot be handed one anyway, because the wl_surface being wrapped
+ * lives in the runtime's process and its address means nothing on this side.
+ *
+ * So these four names are claimed by the ICD and filtered out of everything
+ * the driver reports, in both directions. Enumerating them asks the driver for
+ * its list and appends these; creating an instance asks the driver without
+ * them. Keeping the list in one place is what keeps the two halves agreeing:
+ * a name claimed but not filtered is an instance that never gets created.
+ */
+#define VKFW_WSI_EXTENSIONS(X)                                                                 \
+    X("VK_KHR_surface")                                                                        \
+    X("VK_KHR_swapchain")                                                                      \
+    X("VK_KHR_wayland_surface")                                                                \
+    X("VK_EXT_surface_maintenance1")
+
+/* This layer is the Linux runtime's window system integration, which means it
+ * has to accept Wayland objects. Neither of its builds does: the NDK has no
+ * wayland-client.h, and vk_forward.c is compiled there too, for the loopback
+ * test that drives both halves in one process. Rather than make every build
+ * depend on Wayland headers, declare the struct here, for both halves.
+ *
+ * Plain types only, deliberately: vkfw_protocol.h is included by transport and
+ * codec, which otherwise need no Vulkan headers at all, and pulling vulkan.h in
+ * here would give every translation unit that dependency. The layout matches
+ * the C99 rules Vulkan structs follow, which is the assumption this whole
+ * layer already rests on. Nothing dereferences those pointers - they are
+ * opaque handles the caller keeps and hands back at destroy time.
+ */
+#ifndef VK_USE_PLATFORM_WAYLAND_KHR
+typedef struct VkWaylandSurfaceCreateInfoKHR {
+    int32_t sType;
+    const void *pNext;
+    uint32_t flags;
+    void *display; /* wl_display * */
+    void *surface; /* wl_surface * */
+} VkWaylandSurfaceCreateInfoKHR;
+
+typedef int32_t (*PFN_vkCreateWaylandSurfaceKHR)(void *instance,
+                                                 const VkWaylandSurfaceCreateInfoKHR *pCreateInfo,
+                                                 const void *pAllocator,
+                                                 void *pSurface);
+#endif
+
+/* True when the ICD serves this extension itself, so the driver must not be
+ * told about it. */
+static inline int vkfw_wsi_owned(const char *name)
+{
+    static const char *const owned[] = {
+#define X(n) n,
+        VKFW_WSI_EXTENSIONS(X)
+#undef X
+        NULL
+    };
+    for (const char *const *p = owned; *p; p++) {
+        const char *a = *p, *b = name;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (*a == '\0' && *b == '\0') return 1;
+    }
+    return 0;
+}
+
 struct vkfw_header {
     uint32_t magic;
     uint16_t cmd;

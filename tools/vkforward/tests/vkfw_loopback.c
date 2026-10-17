@@ -265,6 +265,116 @@ static void dump_device_extensions(PFN_vkEnumerateDeviceExtensionProperties fn, 
     free(exts);
 }
 
+/* The instance-level WSI the ICD provides itself: a Wayland client has to be
+ * able to discover an extension no Android driver offers, then create an
+ * instance asking for it, without the driver ever hearing the name. */
+static int wsi_round_trip(PFN_vkGetInstanceProcAddr gipa)
+{
+    PFN_vkEnumerateInstanceExtensionProperties list =
+        (PFN_vkEnumerateInstanceExtensionProperties)gipa(NULL, "vkEnumerateInstanceExtensionProperties");
+    PFN_vkGetInstanceProcAddr igipa = gipa;
+    int failures = 0;
+    if (!list) {
+        printf("[wsi] vkEnumerateInstanceExtensionProperties: missing\n");
+        return 1;
+    }
+
+    uint32_t count = 0;
+    list(NULL, &count, NULL);
+    VkExtensionProperties *props = calloc(count, sizeof(*props));
+    if (!props) return 1;
+    list(NULL, &count, props);
+
+    static const char *const wanted[] = {
+        "VK_KHR_surface", "VK_KHR_swapchain", "VK_KHR_wayland_surface",
+        "VK_EXT_surface_maintenance1",
+    };
+    VkBool32 have[sizeof(wanted) / sizeof(wanted[0])] = { 0 };
+    for (uint32_t i = 0; i < count; i++)
+        for (uint32_t w = 0; w < sizeof(wanted) / sizeof(wanted[0]); w++)
+            if (!strcmp(props[i].extensionName, wanted[w])) have[w] = VK_TRUE;
+
+    printf("[wsi] instance reports %u extensions\n", count);
+    for (uint32_t w = 0; w < sizeof(wanted) / sizeof(wanted[0]); w++) {
+        printf("[wsi]   %-32s %s\n", wanted[w], have[w] ? "advertised" : "MISSING");
+        if (!have[w]) failures++;
+    }
+    free(props);
+    if (failures) return failures;
+
+    /* Now ask for them all, which is what a compositor does and what the
+     * driver must never be told. */
+    VkInstance wsi_instance = VK_NULL_HANDLE;
+    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    app.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo info = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    info.pApplicationInfo = &app;
+    info.enabledExtensionCount = (uint32_t)(sizeof(wanted) / sizeof(wanted[0]));
+    info.ppEnabledExtensionNames = wanted;
+    PFN_vkCreateInstance create = (PFN_vkCreateInstance)igipa(NULL, "vkCreateInstance");
+    VkResult r = create ? create(&info, NULL, &wsi_instance) : VK_ERROR_INITIALIZATION_FAILED;
+    printf("[wsi] vkCreateInstance asking for them all: %s (%d)\n", r == VK_SUCCESS ? "OK" : "FAILED", r);
+    if (r != VK_SUCCESS) return ++failures;
+
+    /* A surface is ours, not the driver's: no display lives here. */
+    PFN_vkCreateWaylandSurfaceKHR make_surface =
+        (PFN_vkCreateWaylandSurfaceKHR)igipa(wsi_instance, "vkCreateWaylandSurfaceKHR");
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    if (!make_surface) {
+        printf("[wsi] vkCreateWaylandSurfaceKHR: missing from the instance table\n");
+        return ++failures;
+    }
+    VkWaylandSurfaceCreateInfoKHR surface_info = {
+        VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR, NULL, 0, NULL, NULL
+    };
+    r = make_surface(wsi_instance, &surface_info, NULL, &surface);
+    printf("[wsi] vkCreateWaylandSurfaceKHR: %s\n", (r == VK_SUCCESS && surface) ? "OK" : "FAILED");
+    if (r != VK_SUCCESS || !surface) return ++failures;
+
+    PFN_vkEnumeratePhysicalDevices pd_list =
+        (PFN_vkEnumeratePhysicalDevices)igipa(wsi_instance, "vkEnumeratePhysicalDevices");
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR caps =
+        (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)igipa(wsi_instance,
+                                                            "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR fmts =
+        (PFN_vkGetPhysicalDeviceSurfaceFormatsKHR)igipa(wsi_instance,
+                                                        "vkGetPhysicalDeviceSurfaceFormatsKHR");
+    uint32_t pd_count = 0;
+    VkPhysicalDevice *pds = NULL;
+    if (pd_list) {
+        pd_list(wsi_instance, &pd_count, NULL);
+        pds = calloc(pd_count, sizeof(*pds));
+        if (pds) pd_list(wsi_instance, &pd_count, pds);
+    }
+    if (!pds || !caps || !fmts) {
+        printf("[wsi] surface queries: missing\n");
+        return ++failures;
+    }
+    VkSurfaceCapabilitiesKHR cap = { 0 };
+    r = caps(pds[0], surface, &cap);
+    printf("[wsi] capabilities: %s %ux%u, %u-%u images\n", r == VK_SUCCESS ? "OK" : "FAILED",
+           cap.currentExtent.width, cap.currentExtent.height, cap.minImageCount, cap.maxImageCount);
+    if (r != VK_SUCCESS || cap.currentExtent.width == 0) failures++;
+
+    uint32_t fmt_count = 0;
+    fmts(pds[0], surface, &fmt_count, NULL);
+    VkSurfaceFormatKHR *f = calloc(fmt_count, sizeof(*f));
+    printf("[wsi] surface formats: %u offered\n", fmt_count);
+    if (f && fmt_count) fmts(pds[0], surface, &fmt_count, f);
+    if (!f || fmt_count == 0) failures++;
+
+    PFN_vkDestroySurfaceKHR kill =
+        (PFN_vkDestroySurfaceKHR)igipa(wsi_instance, "vkDestroySurfaceKHR");
+    if (kill) kill(wsi_instance, surface, NULL);
+    PFN_vkDestroyInstance destroy_inst =
+        (PFN_vkDestroyInstance)igipa(wsi_instance, "vkDestroyInstance");
+    if (destroy_inst) destroy_inst(wsi_instance, NULL);
+    free(f);
+    free(pds);
+    printf("[wsi] done\n");
+    return failures;
+}
+
 int main(int argc, char **argv)
 {
     const char *driver = getenv("VKFW_DRIVER");
@@ -438,5 +548,7 @@ int main(int argc, char **argv)
 
     printf("\n%s\n", failures == 0 ? "M1 loopback: PASS" : "M1 loopback: FAIL");
     int sweep = tool_style_sweep(gipa);
-    return (failures == 0 && sweep == 0) ? 0 : 1;
+    printf("\n[wsi] instance-level window system integration\n");
+    int wsi = wsi_round_trip(gipa);
+    return (failures == 0 && sweep == 0 && wsi == 0) ? 0 : 1;
 }

@@ -261,9 +261,17 @@ static void h_enumerate_instance_extensions(struct vkfw_request *req, void *unus
         }
         r = fn(layer, &count, props);
     }
-    vkfw_buf_put_result(req->out, props ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED);
-    vkfw_buf_put_u32(req->out, props ? count : 0);
+    /* The driver's list, minus anything the ICD serves itself (it will not
+     * have listed them anyway), plus the WSI the ICD owns. The ICD appends
+     * its own set on the way out; this side only has to not contradict it. */
+    uint32_t kept = 0;
+    for (uint32_t i = 0; props && i < count; i++)
+        if (!vkfw_wsi_owned(props[i].extensionName)) kept++;
+
+    vkfw_buf_put_result(req->out, count == 0 && !props ? VK_ERROR_INITIALIZATION_FAILED : VK_SUCCESS);
+    vkfw_buf_put_u32(req->out, kept);
     for (uint32_t i = 0; props && i < count; i++) {
+        if (vkfw_wsi_owned(props[i].extensionName)) continue;
         vkfw_buf_put_str(req->out, props[i].extensionName);
         vkfw_buf_put_u32(req->out, props[i].specVersion);
     }
@@ -293,6 +301,20 @@ static void h_create_instance(struct vkfw_request *req, void *unused)
         goto cleanup;
     }
 
+    /* The driver never hears about an extension the ICD serves: it would
+     * refuse it, and the instance would not be created. What is left is what
+     * the caller and the driver genuinely agree on. */
+    char **kept = ext_count ? calloc(ext_count, sizeof(*kept)) : NULL;
+    uint32_t kept_count = 0;
+    if (ext_count && !kept) {
+        vkfw_buf_put_result(req->out, VK_ERROR_OUT_OF_HOST_MEMORY);
+        goto cleanup;
+    }
+    for (uint32_t i = 0; i < ext_count; i++) {
+        if (vkfw_wsi_owned(exts[i])) continue;
+        kept[kept_count++] = exts[i];
+    }
+
     VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
     app.pApplicationName = app_name;
     app.applicationVersion = app_version;
@@ -304,17 +326,20 @@ static void h_create_instance(struct vkfw_request *req, void *unused)
     info.pApplicationInfo = (app_name || engine_name) ? &app : NULL;
     info.enabledLayerCount = layer_count;
     info.ppEnabledLayerNames = (const char *const *)layers;
-    info.enabledExtensionCount = ext_count;
-    info.ppEnabledExtensionNames = (const char *const *)exts;
+    info.enabledExtensionCount = kept_count;
+    info.ppEnabledExtensionNames = (const char *const *)kept;
 
     VkInstance instance = VK_NULL_HANDLE;
     VkResult r = create(&info, NULL, &instance);
     if (r != VK_SUCCESS) {
-        LOGE("vkCreateInstance failed (%d), %u extensions requested", r, ext_count);
-        for (uint32_t i = 0; i < ext_count; i++) LOGE("  %s", exts[i]);
+        LOGE("vkCreateInstance failed (%d), %u extensions requested, %u passed on",
+             r, ext_count, kept_count);
+        for (uint32_t i = 0; i < kept_count; i++) LOGE("  %s", kept[i]);
+        free(kept);
         vkfw_buf_put_result(req->out, r);
         goto cleanup;
     }
+    free(kept);
     vkfw_buf_put_result(req->out, VK_SUCCESS);
     vkfw_buf_put_u64(req->out, vkfw_handle_add(&req->conn->handles, VKFW_OBJ_INSTANCE, instance, 0));
     goto cleanup;

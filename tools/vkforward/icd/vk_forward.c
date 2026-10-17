@@ -38,6 +38,8 @@ enum {
     VKFW_TYPE_DEVICE,
     VKFW_TYPE_QUEUE,
     VKFW_TYPE_IMAGE,
+    VKFW_TYPE_SURFACE,
+    VKFW_TYPE_SWAPCHAIN,
 };
 
 /* Cached children so repeated queries return identical handles. */
@@ -117,6 +119,12 @@ static struct vkfw_instance *vkfw_as_instance(VkInstance i)
 static struct vkfw_device *vkfw_as_device(VkDevice d)
 {
     return d ? (struct vkfw_device *)d : NULL;
+}
+
+struct vkfw_surface;
+static struct vkfw_surface *vkfw_as_surface(VkSurfaceKHR s)
+{
+    return s ? (struct vkfw_surface *)s : NULL;
 }
 
 /* ---- transport plumbing ------------------------------------------------- */
@@ -226,7 +234,45 @@ static VkResult vkfw_vkEnumerateInstanceExtensionProperties(const char *layerNam
     }
     vkfw_buf_free(&reply);
 
-    if (count > *pPropertyCount) {
+    /* The WSI the ICD serves itself, appended after the driver's list. These
+     * are the ones a Wayland or X11 client insists on and an Android driver
+     * has never provided. */
+    static const struct { const char *name; uint32_t version; } wsi[] = {
+        { "VK_KHR_surface", 25 },
+        { "VK_KHR_swapchain", 70 },
+        { "VK_KHR_wayland_surface", 6 },
+        { "VK_EXT_surface_maintenance1", 1 },
+    };
+    const uint32_t wsi_count = (uint32_t)(sizeof(wsi) / sizeof(wsi[0]));
+
+    if (!pProperties) {
+        /* A count-only query still has to have gone out, so a driver that is
+         * not reachable fails here rather than claiming to have extensions. */
+        vkfw_buf_free(&reply);
+        if (result != VK_SUCCESS) {
+            *pPropertyCount = 0;
+            return result;
+        }
+        *pPropertyCount = count + wsi_count;
+        return VK_SUCCESS;
+    }
+
+    for (uint32_t i = 0; i < wsi_count; i++) {
+        if (wrote >= *pPropertyCount) {
+            result = VK_INCOMPLETE;
+            break;
+        }
+        VkExtensionProperties *dst = &pProperties[wrote];
+        memset(dst, 0, sizeof(*dst));
+        size_t n = strlen(wsi[i].name);
+        if (n >= sizeof(dst->extensionName)) n = sizeof(dst->extensionName) - 1;
+        memcpy(dst->extensionName, wsi[i].name, n);
+        dst->extensionName[n] = '\0';
+        dst->specVersion = wsi[i].version;
+        wrote++;
+    }
+
+    if (count + wsi_count > *pPropertyCount) {
         *pPropertyCount = wrote;
         return VK_INCOMPLETE;
     }
@@ -1361,6 +1407,164 @@ static void vkfw_vkGetImageSparseMemoryRequirements(VkDevice device, VkImage ima
     vkfw_buf_free(&reply);
 }
 
+/* ---- window system integration -----------------------------------------
+ *
+ * The driver on the other side of the socket is an Android driver. It knows
+ * VK_KHR_android_surface and nothing else, and it could not use a Wayland
+ * surface even if it did: the wl_surface being wrapped belongs to the
+ * runtime's process, and a pointer into that process means nothing here.
+ *
+ * So the ICD is the WSI provider. Surfaces are ours to create and destroy;
+ * what they hold is a size and a format, which is all a swapchain needs. The
+ * presentation side is the part that has to come from somewhere real, and it
+ * comes from the session: BL_WIDTH and BL_HEIGHT are how the app tells the
+ * runtime how big the output is, and the same numbers are what a swapchain
+ * here has to match.
+ *
+ * A swapchain's images are ordinary VkImages, created by the driver and
+ * forwarded like any other, so the image contents are real memory on the
+ * driver's side. Getting those pixels in front of the user is the next
+ * question, and it is the one thing this file cannot answer on its own.
+ */
+struct vkfw_surface {
+    struct vkfw_object base;
+    uint32_t width;
+    uint32_t height;
+};
+
+static void vkfw_wsi_output_size(uint32_t *w, uint32_t *h)
+{
+    const char *ew = getenv("BL_WIDTH"), *eh = getenv("BL_HEIGHT");
+    uint32_t width = ew ? (uint32_t)strtoul(ew, NULL, 10) : 0;
+    uint32_t height = eh ? (uint32_t)strtoul(eh, NULL, 10) : 0;
+    /* The session always sets these; a desktop session started by hand may
+     * not, and a zero-sized surface fails every check that follows. */
+    *w = width ? width : 1280;
+    *h = height ? height : 720;
+}
+
+static VkResult vkfw_vkCreateWaylandSurfaceKHR(VkInstance instance,
+                                               const VkWaylandSurfaceCreateInfoKHR *pCreateInfo,
+                                               const VkAllocationCallbacks *pAllocator,
+                                               VkSurfaceKHR *pSurface)
+{
+    (void)instance;
+    (void)pAllocator;
+    if (!pCreateInfo || !pSurface) return VK_ERROR_INITIALIZATION_FAILED;
+    *pSurface = VK_NULL_HANDLE;
+
+    struct vkfw_surface *s = calloc(1, sizeof(*s));
+    if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    vkfw_obj_init(&s->base, VKFW_TYPE_SURFACE, 0); /* no server-side handle */
+    vkfw_wsi_output_size(&s->width, &s->height);
+    *pSurface = (VkSurfaceKHR)s;
+    return VK_SUCCESS;
+}
+
+static void vkfw_vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
+                                     const VkAllocationCallbacks *pAllocator)
+{
+    (void)instance;
+    (void)pAllocator;
+    free(vkfw_as_surface(surface));
+}
+
+static VkResult vkfw_vkGetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice physicalDevice,
+                                                          uint32_t queueFamilyIndex,
+                                                          VkSurfaceKHR surface,
+                                                          VkBool32 *pSupported)
+{
+    (void)physicalDevice;
+    if (!surface || !pSupported) return VK_ERROR_INITIALIZATION_FAILED;
+    /* Every queue family can present: presentation does not go to the driver,
+     * so there is no queue that could lack the capability. */
+    (void)queueFamilyIndex;
+    *pSupported = VK_TRUE;
+    return VK_SUCCESS;
+}
+
+static VkResult vkfw_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+    VkPhysicalDevice physicalDevice, VkSurfaceKHR surface,
+    VkSurfaceCapabilitiesKHR *pCapabilities)
+{
+    (void)physicalDevice;
+    struct vkfw_surface *s = vkfw_as_surface(surface);
+    if (!s || !pCapabilities) return VK_ERROR_INITIALIZATION_FAILED;
+
+    memset(pCapabilities, 0, sizeof(*pCapabilities));
+    pCapabilities->minImageCount = 2;
+    pCapabilities->maxImageCount = 3;
+    /* currentExtent says "take it from currentExtent", not "any size": a
+     * compositor wants the swapchain to match the output so it can present
+     * without a scaling pass. */
+    pCapabilities->currentExtent.width = s->width;
+    pCapabilities->currentExtent.height = s->height;
+    pCapabilities->minImageExtent.width = s->width;
+    pCapabilities->minImageExtent.height = s->height;
+    pCapabilities->maxImageExtent.width = s->width;
+    pCapabilities->maxImageExtent.height = s->height;
+    pCapabilities->maxImageArrayLayers = 1;
+    pCapabilities->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    pCapabilities->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    pCapabilities->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR |
+                                            VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+    pCapabilities->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                         VK_IMAGE_USAGE_SAMPLED_BIT |
+                                         VK_IMAGE_USAGE_STORAGE_BIT;
+    return VK_SUCCESS;
+}
+
+static VkResult vkfw_vkGetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physicalDevice,
+                                                          VkSurfaceKHR surface,
+                                                          uint32_t *pCount,
+                                                          VkSurfaceFormatKHR *pFormats)
+{
+    (void)physicalDevice;
+    if (!surface || !pCount) return VK_ERROR_INITIALIZATION_FAILED;
+
+    /* BGRA8 is what a compositor's own render target wants and what the
+     * driver's images can be created as without a conversion pass. */
+    static const VkSurfaceFormatKHR formats[] = {
+        { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
+        { VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
+    };
+    const uint32_t available = (uint32_t)(sizeof(formats) / sizeof(formats[0]));
+
+    if (!pFormats) {
+        *pCount = available;
+        return VK_SUCCESS;
+    }
+    uint32_t n = *pCount < available ? *pCount : available;
+    memcpy(pFormats, formats, n * sizeof(*formats));
+    *pCount = n;
+    return n < available ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+static VkResult vkfw_vkGetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice physicalDevice,
+                                                               VkSurfaceKHR surface,
+                                                               uint32_t *pCount,
+                                                               VkPresentModeKHR *pModes)
+{
+    (void)physicalDevice;
+    if (!surface || !pCount) return VK_ERROR_INITIALIZATION_FAILED;
+
+    /* FIFO always has to be there. The rest are honest to offer only once
+     * presenting is real; FIFO is the one a compositor falls back to anyway. */
+    static const VkPresentModeKHR modes[] = { VK_PRESENT_MODE_FIFO_KHR };
+    const uint32_t available = (uint32_t)(sizeof(modes) / sizeof(modes[0]));
+
+    if (!pModes) {
+        *pCount = available;
+        return VK_SUCCESS;
+    }
+    uint32_t n = *pCount < available ? *pCount : available;
+    memcpy(pModes, modes, n * sizeof(*modes));
+    *pCount = n;
+    return n < available ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
 /* ---- dispatchables ------------------------------------------------------ */
 
 /* Set VKFW_TRACE=1 to log the entry points we cannot serve. Those are exactly
@@ -1465,6 +1669,12 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkfw_vkGetInstanceProcAddr(VkIns
     ENTRY(vkGetPhysicalDeviceExternalFenceProperties);
     ENTRY(vkGetPhysicalDeviceExternalSemaphoreProperties);
     ENTRY(vkGetPhysicalDeviceToolProperties);
+    ENTRY(vkCreateWaylandSurfaceKHR);
+    ENTRY(vkDestroySurfaceKHR);
+    ENTRY(vkGetPhysicalDeviceSurfaceSupportKHR);
+    ENTRY(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
+    ENTRY(vkGetPhysicalDeviceSurfaceFormatsKHR);
+    ENTRY(vkGetPhysicalDeviceSurfacePresentModesKHR);
     /* Pre-promotion aliases: tools that enable VK_KHR_get_physical_device_properties2
      * still call these commands under their KHR names, and the EXT-suffixed tool
      * properties is the same command, so all spellings must resolve. */
