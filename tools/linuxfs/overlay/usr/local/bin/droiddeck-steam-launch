@@ -26,22 +26,23 @@ if [ "$ui" = desktop ] && [ "${BL_DESKTOP:-}" = 1 ]; then
   mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/droiddeck"
   exec 9>"${XDG_CACHE_HOME:-$HOME/.cache}/droiddeck/steam-desktop.lock"
   if ! flock -n 9; then
-    echo "== the desktop lock is held, waiting for the running client"
+    # stderr, not stdout: stdout is the client's own channel and is asserted on
+    echo "== the desktop lock is held, waiting for the running client" >&2
     for ((attempt = 0; attempt < 180; attempt++)); do
       pid=$(cat "$HOME/.steam/steam.pid" 2>/dev/null || true)
       if [ -p "$HOME/.steam/steam.pipe" ] && [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-        echo "== handing $* to the running client (pid $pid)"
+        echo "== handing $* to the running client (pid $pid)" >&2
         exec "$steam_root/steamrtarm64/steam" -nobigpicture -no-cef-sandbox \
           -cef-ozone-platform=x11 -cef-disable-gpu "${url:-steam://open/library}"
       fi
-      [ $((attempt % 20)) = 0 ] && echo "== still waiting: pid=${pid:-none} pipe=$( [ -p "$HOME/.steam/steam.pipe" ] && echo yes || echo no)"
+      [ $((attempt % 20)) = 0 ] && echo "== still waiting: pid=${pid:-none} pipe=$( [ -p "$HOME/.steam/steam.pipe" ] && echo yes || echo no)" >&2
       sleep 0.5
     done
     echo "droiddeck-steam-launch: the desktop client did not become ready" >&2
     exit 69
   fi
   export BL_INSIDE=1 BL_STEAM_UI=desktop
-  echo "== starting a client through droiddeck-session steam ${url:-steam://open/library}"
+  echo "== starting a client through droiddeck-session steam ${url:-steam://open/library}" >&2
   exec /usr/local/bin/droiddeck-session steam "${url:-steam://open/library}"
 fi
 
