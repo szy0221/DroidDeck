@@ -123,11 +123,19 @@ static int image_round_trip(PFN_vkGetInstanceProcAddr gipa, VkDevice device)
  */
 static int memory_round_trip(PFN_vkGetInstanceProcAddr gipa, VkDevice device)
 {
-    PFN_vkAllocateMemory alloc_memory = (PFN_vkAllocateMemory)gipa(NULL, "vkAllocateMemory");
-    PFN_vkFreeMemory free_memory = (PFN_vkFreeMemory)gipa(NULL, "vkFreeMemory");
-    PFN_vkMapMemory map_memory = (PFN_vkMapMemory)gipa(NULL, "vkMapMemory");
-    PFN_vkUnmapMemory unmap_memory = (PFN_vkUnmapMemory)gipa(NULL, "vkUnmapMemory");
-    PFN_vkGetMemoryFdKHR get_memory_fd = (PFN_vkGetMemoryFdKHR)gipa(NULL, "vkGetMemoryFdKHR");
+    /* Memory commands are device commands, which is what GetDeviceProcAddr is
+     * for: the ICD's instance table does not carry them, and an instance-level
+     * lookup would find nothing and look like a broken layer. */
+    PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)gipa(NULL, "vkGetDeviceProcAddr");
+    if (!gdpa) {
+        printf("[memory] entry points: missing\n");
+        return 1;
+    }
+    PFN_vkAllocateMemory alloc_memory = (PFN_vkAllocateMemory)gdpa(device, "vkAllocateMemory");
+    PFN_vkFreeMemory free_memory = (PFN_vkFreeMemory)gdpa(device, "vkFreeMemory");
+    PFN_vkMapMemory map_memory = (PFN_vkMapMemory)gdpa(device, "vkMapMemory");
+    PFN_vkUnmapMemory unmap_memory = (PFN_vkUnmapMemory)gdpa(device, "vkUnmapMemory");
+    PFN_vkGetMemoryFdKHR get_memory_fd = (PFN_vkGetMemoryFdKHR)gdpa(device, "vkGetMemoryFdKHR");
     if (!alloc_memory || !free_memory || !map_memory || !unmap_memory || !get_memory_fd) {
         printf("[memory] entry points: missing\n");
         return 1;

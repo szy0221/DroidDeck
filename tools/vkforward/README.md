@@ -152,8 +152,9 @@ on every change.
 
 ## Known gaps (to close in M2/M3)
 
-- No rendering commands yet: memory, buffers, images, command buffers and queue
-  submission reply `VK_ERROR_FEATURE_NOT_PRESENT`.
+- No rendering commands yet: buffers, image views, command buffers and queue
+  submission reply `VK_ERROR_FEATURE_NOT_PRESENT`. **Device memory is
+  forwarded** — see the next point.
 - Core commands that are not implemented answer with a stub that returns that
   error rather than with NULL. The loader builds a trampoline for every core
   command whatever the ICD behind it can do, and the trampoline dispatches
@@ -162,6 +163,16 @@ on every change.
   what an app checks before using the extension.
 - `vkCreateInstance` forwards app/engine info and enabled names only; the
   loader's own pNext nodes do not cross the socket.
+- **Device memory is a dma-buf, not an opaque id.** A pointer the driver hands
+  out in the app process means nothing in the runtime process, so
+  `vkMapMemory` is the one thing that cannot be forwarded — there is no value
+  to send back. Instead the server creates the backing store as a memfd,
+  imports it into the driver as a dma-buf, and sends the descriptor with the
+  reply. The ICD maps its own copy (`vkMapMemory`) and dups it
+  (`vkGetMemoryFdKHR`), so the caller can write into the memory and a
+  compositor can import the image. Drivers that will not import a dma-buf get
+  a plain allocation plus a warning: that memory cannot be mapped or exported,
+  and the caller learns that from `vkMapMemory`, not from `vkAllocateMemory`.
 - **Window system integration is the ICD's own, not the driver's.** A Wayland
   compositor asks for `VK_KHR_surface`, `VK_KHR_swapchain`,
   `VK_KHR_wayland_surface` and `VK_EXT_surface_maintenance1`, and an Android
