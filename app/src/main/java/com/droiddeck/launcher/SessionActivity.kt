@@ -1982,6 +1982,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
      * no way to reach a shell at all. Show the same panel on the device itself.
      */
     fun openOnScreenTerminal() {
+        Log.i(TAG, "on-screen terminal requested (started=$started)")
         if (!started) return
         onScreenTerminal?.takeIf { it.isShowing }?.let { return }
         val panel = TerminalPanel(this) { closeOnScreenTerminal() }
@@ -1994,6 +1995,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         onScreenTerminal = dialog
         dialog.show()
         panel.start()
+        Log.i(TAG, "on-screen terminal shown (showing=${dialog.isShowing})")
     }
 
     private fun closeOnScreenTerminal() {

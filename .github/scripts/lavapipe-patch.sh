@@ -77,6 +77,106 @@ new = """#if defined(HAVE_MEMFD_CREATE) || DETECT_OS_ANDROID
 #endif"""
 patch(p, old, new, 'sealing is not fatal')
 
+# ------------------------------------------- 1b. actually getting a file fd --
+# The r3 log settled where the export really dies: 11 export attempts, all with
+# fd=-1, and the sealing warning never printed once. So os_create_anonymous_file()
+# itself returned -1 and the allocation never reached fcntl(F_ADD_SEALS).
+#
+# Its two paths are memfd_create() and a mkostemp() file; the second needs a
+# writable XDG_RUNTIME_DIR/TMPDIR, and the first can be refused outright by the
+# proot ptrace layer. Neither is guaranteed here, so try them again explicitly
+# and then fall through to POSIX shared memory and a plain temp file.
+#
+# Any descriptor that can be mmap'd MAP_SHARED and handed to another process is
+# good enough: lavapipe and gamescope are both software, so this buffer never
+# reaches a GPU and the kernel does not have to back it with a dma-buf. The only
+# thing that has to work is the mmap() below and os_import_memory_fd() on the far
+# side, both of which are indifferent to how the descriptor was made.
+s = ensure_includes(p, '#include <string.h>',
+                    ['#include <limits.h>', '#include <stdlib.h>', '#include <sys/stat.h>'])
+with open(p, 'w') as fh:
+    fh.write(s)
+
+old = """   mem_fd = os_create_anonymous_file(alloc_size, fd_name);
+
+   if(mem_fd < 0)
+      return NULL;"""
+new = """/* DroidDeck: these live in <sys/mman.h> only with _GNU_SOURCE and a recent
+ * enough glibc; define them so the fallbacks below build anywhere. */
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING 0x0002U
+#endif
+
+   mem_fd = os_create_anonymous_file(alloc_size, fd_name);
+
+   if (mem_fd < 0) {
+      /* DroidDeck: without a usable descriptor every Vulkan external-memory
+       * allocation fails, and gamescope reports it as
+       * "vkAllocateMemory failed (-2)" while never presenting a frame. Walk
+       * the ways of getting one, from the most to the least private, and say
+       * which of them worked so the next exported log can be read directly. */
+      static unsigned long fallback_seq;
+      int saved_errno = errno;
+      const char *how = "none";
+
+#ifdef HAVE_MEMFD_CREATE
+      if (mem_fd < 0) {
+         mem_fd = memfd_create(fd_name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
+         if (mem_fd >= 0) how = "memfd(sealing)";
+      }
+      if (mem_fd < 0) {
+         mem_fd = memfd_create(fd_name, MFD_CLOEXEC);
+         if (mem_fd >= 0) how = "memfd";
+      }
+#endif
+      if (mem_fd < 0) {
+         char shm_name[256];
+         snprintf(shm_name, sizeof(shm_name), "/mesa-lvp-%ld-%lu",
+                  (long) getpid(), fallback_seq++);
+         mem_fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
+         if (mem_fd >= 0) {
+            shm_unlink(shm_name);
+            how = "shm";
+         }
+      }
+      if (mem_fd < 0) {
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
+         const char *dirs[] = { getenv("XDG_RUNTIME_DIR"), getenv("TMPDIR"), "/tmp", "/var/tmp" };
+         for (unsigned i = 0; i < ARRAY_SIZE(dirs) && mem_fd < 0; i++) {
+            char tmpl[PATH_MAX];
+            if (!dirs[i] || !*dirs[i])
+               continue;
+            if (snprintf(tmpl, sizeof(tmpl), "%s/mesa-lvp-XXXXXX", dirs[i]) >= (int) sizeof(tmpl))
+               continue;
+            mem_fd = mkstemp(tmpl);
+            if (mem_fd >= 0) {
+               int flags = fcntl(mem_fd, F_GETFD);
+               if (flags >= 0)
+                  fcntl(mem_fd, F_SETFD, flags | FD_CLOEXEC);
+               unlink(tmpl);
+               how = "tmpfile";
+            }
+         }
+      }
+      if (mem_fd >= 0 && ftruncate(mem_fd, alloc_size) != 0) {
+         close(mem_fd);
+         mem_fd = -1;
+         how = "ftruncate failed";
+      }
+      fprintf(stderr, "[mesa-fd] os_create_anonymous_file(%llu) failed errno=%d, "
+                      "fallback %s -> fd=%d\\n",
+              (unsigned long long) alloc_size, saved_errno, how, mem_fd);
+   }
+
+   if(mem_fd < 0)
+      return NULL;"""
+patch(p, old, new, 'fallback ways to get an exportable fd')
+
 # ------------------------------------------------------- 2. lavapipe fallback --
 p = 'src/gallium/frontends/lavapipe/lvp_device.c'
 s = ensure_includes(p, '#include "lvp_private.h"', ['#include <stdio.h>'])

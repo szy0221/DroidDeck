@@ -552,6 +552,16 @@ internal fun SessionDrawer(open: Boolean, requestedPage: SessionDrawerPage, cont
                             )
                         }
                         SessionDrawerPage.SESSION -> {
+                            // A shell is how anyone debugs what goes wrong inside the
+                            // runtime, so it belongs where it is easy to find - not only
+                            // on the second-screen page, which reads as if it needed a
+                            // second screen.
+                            SettingsGroup(stringResource(R.string.second_terminal)) {
+                                ActionRow(stringResource(R.string.second_terminal_on_this_screen),
+                                    stringResource(R.string.second_terminal_on_this_screen_hint),
+                                    stringResource(R.string.second_terminal_open),
+                                    { host.open = null; a.onOnScreenTerminal() })
+                            }
                             if (a.isHomeApp) SettingsGroup(stringResource(R.string.drawer_android_apps)) {
                                 SettingsRow(stringResource(R.string.drawer_launch_app), null) {
                                     DrawerOutlineButton(if (androidAppsExpanded) stringResource(R.string.common_hide) else stringResource(R.string.common_show), modifier = focus.track(page, "apps")) {
