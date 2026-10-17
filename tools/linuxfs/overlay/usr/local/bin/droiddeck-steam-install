@@ -1,6 +1,47 @@
 #!/bin/bash
 set -eu
 cdn=https://client-update.fastly.steamstatic.com
+# Every session that repairs or first-installs the client pulls ~1 GB through
+# whatever link the phone is on, and one host being unreachable used to lose the
+# whole download. These are the hosts Steam itself keeps in update_hosts_cached,
+# plus one the client was seen preferring; each part is checked against the
+# manifest's sha2, so a host serving something else is rejected, not installed.
+hosts=("$cdn" https://client-update.akamai.steamstatic.com https://client-update.steamstatic.com
+       https://media.st.dl.eccdnx.com/client https://client-update.queniuqe.com)
+if [ -n "${DROIDDECK_STEAM_CDN:-}" ]; then
+  hosts=("$DROIDDECK_STEAM_CDN" "${hosts[@]}")
+fi
+# fetch <path on the host> <file to write>
+#
+# Walk the hosts above, three attempts on the preferred one (resuming the bytes
+# already on disk, because a reset mid-stream is usually transient) and one each
+# on the rest. Below 1 KiB/s for a whole minute is not a download, it is a dead
+# tunnel, so give up on that attempt instead of sitting there looking hung.
+fetch() {
+  local path=$1 out=$2 host attempt tries rc=1 first=1
+  for host in "${hosts[@]}"; do
+    rm -f "$out"
+    # The preferred host gets retried: a connection reset mid-stream is usually
+    # transient, and resuming keeps the bytes already pulled. The fallbacks get
+    # one try each, so a network that is really down fails in minutes, not hours.
+    tries=1
+    [ "$first" = 1 ] && tries=3 && first=0
+    for ((attempt = 1; attempt <= tries; attempt++)); do
+      if [ "$attempt" -eq 1 ]; then
+        curl -fsSL "$host/$path" -o "$out" --connect-timeout 20 \
+             --speed-time 60 --speed-limit 1024 && return 0
+      else
+        curl -fsSL "$host/$path" -o "$out" -C - --connect-timeout 20 \
+             --speed-time 60 --speed-limit 1024 && return 0
+      fi
+      rc=$?
+      echo "== STEP $(date -u +%H:%M:%S) retrying $path from ${host#*//} (attempt $attempt failed, rc=$rc)"
+      sleep 3
+    done
+  done
+  echo "droiddeck-steam-install: no download host would serve $path" >&2
+  return $rc
+}
 steam_channel=steamdeck_publicbeta
 manifest=steam_client_${steam_channel}_linuxarm64
 steam_root=${XDG_DATA_HOME:-$HOME/.local/share}/Steam
@@ -37,7 +78,7 @@ fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-curl -fsSL "$cdn/$manifest" -o "$work/manifest"
+fetch "$manifest" "$work/manifest"
 version=$(awk -F'"' '$2 == "version" { print $4; exit }' "$work/manifest")
 awk -F'"' '
   /^\t"/ && NF >= 3 && $4 == "" { block = $2 }
@@ -52,7 +93,7 @@ mkdir -p "$steam_root/package"
 while read -r block file sum; do
   i=$((${i:-0} + 1))
   echo "== STEP $(date -u +%H:%M:%S) downloading Steam: $block ($i/$total)"
-  curl -fsSL "$cdn/$file" -o "$work/$file"
+  fetch "$file" "$work/$file"
   echo "$sum  $work/$file" | sha256sum -c --quiet
   unzip -qo "$work/$file" -d "$steam_root"
   rm -f "$work/$file"
