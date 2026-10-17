@@ -1943,6 +1943,9 @@ static void h_get_semaphore_counter_value(struct vkfw_request *req, void *unused
         (VkSemaphore)vkfw_handle_get(&req->conn->handles, sem_id, VKFW_OBJ_SEMAPHORE);
     PFN_vkGetSemaphoreCounterValue fn = (PFN_vkGetSemaphoreCounterValue)vkfw_device_proc(vkfw_instance_of(req->conn, dev_id), device, "vkGetSemaphoreCounterValue");
     if (!device || !semaphore || !fn) {
+        LOGW("semaphore counter: device=%d semaphore=%d entry=%d (id %llu of %u slots)",
+             device != NULL, semaphore != NULL, fn != NULL, (unsigned long long)sem_id,
+             req->conn->handles.count);
         vkfw_buf_put_result(req->out, VK_ERROR_INITIALIZATION_FAILED);
         return;
     }
